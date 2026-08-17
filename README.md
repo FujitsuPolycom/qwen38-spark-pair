@@ -2,17 +2,17 @@
 
 **A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on 2× NVIDIA DGX Spark (GB10) at TP2**, with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, 2-rail RoCE striping, prefix caching, and an LMCache L1+NVMe KV tier.
 
-Measured on the reference pair: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+Measured on one such pair — the "reference pair" referenced throughout: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
 
 This document is written to be executed by an LLM agent with SSH access to both Sparks. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
-> Not affiliated with the sparkring project, but its NCCL patches and container pinning are used as upstream ingredients. Nothing here modifies any upstream repo.
+> Not affiliated with the sparkring project (source of the switchless-ring NCCL patches built in Phase 6 and the container pin in Phase 2), but its NCCL patches and container pinning are used as upstream ingredients. Nothing here modifies any upstream repo.
 
 ---
 
 ## What you need
 
-- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS (Ubuntu 24.04.4 LTS as tested) with **driver 580.173.02** (any 580.x should behave identically) (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see Phase 5 backend pins), Docker with NVIDIA runtime.
+- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS (Ubuntu 24.04.4 LTS as tested) with **driver 580.173.02** (any 580.x should behave identically) (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see the Phase 9 backend pins), Docker with NVIDIA runtime.
 - 2–4 direct 200G QSFP cables between the pair's ConnectX-7 ports (2 minimum, one per card; 4 harmless, only 2 are used).
 - ~80 GB free disk per node (model + build trees + cache tier headroom; NVMe cache cap is configurable).
 - A LAN IP for each node and SSH between them.
@@ -97,7 +97,7 @@ docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
 sudo nvidia-ctk system create-dev-char-symlinks --create-all
 ```
 
-   `boot-stack-aa42.sh` also detects the condition and restarts the container, but preventing it
+   `scripts/boot-stack-aa42.sh` (the boot-persistence script installed in Phase 9) also detects the condition and restarts the container, but preventing it
    is better than recovering from it — the recovery costs a restart cycle and only fires at boot.
 
 4. [both, optional] NET_ADMIN helper for sudo-less rail IPs at boot: `docker run -d --name netadm --restart unless-stopped --network host --cap-add NET_ADMIN ubuntu:24.04 sleep infinity`.
@@ -153,7 +153,7 @@ cd /ws/src && git clone https://github.com/local-inference-lab/vllm vllm-gg && c
 git checkout fa033bd4e                     # dev/gilded-gnosis pin
 git fetch origin pull/318/head:pr318
 git merge 2b96dad45                        # PR-318 head as tested (⊇ #316 ⊇ #314); merges clean
-# PR 318 is still open — merging `pr318` instead takes whatever its head is today,
+# PR 318 was open as of the 2026-08-17 pin verification — merging `pr318` instead takes whatever its head is today,
 # which may not be the state these numbers were measured on.
 git am /ws/patches/fork-ports.patch        # our two ports: vLLM #51113 + #48425 (see below)
 TORCH_CUDA_ARCH_LIST="12.0f" pip install -e . --no-build-isolation   # 12.0f REQUIRED (see troubleshooting)
@@ -192,7 +192,7 @@ moved before debugging anything else.
 ## Phase 5 — Model + template
 
 1. Download the checkpoint **at the tested revision** (21.61 GiB — the bare repo ID is mutable;
-   its model card changed during this campaign, weights unchanged):
+   its model card can change while the weight files stay the same):
 
 ```
 huggingface-cli download malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated \n  --revision ab3a91a13813df8096cb4c1d560ed3669035d0cf --local-dir /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated
@@ -210,7 +210,7 @@ Build NCCL 2.30.7 with the sparkring switchless-ring patches — the [sparkring 
 cd /ws/nccl-patched && ln -sf libnccl.so.2.30.7 libnccl.so.2 && ln -sf libnccl.so.2 libnccl.so
 ```
 
-Verify: `sha256sum libnccl.so.2.30.7` → `e69a8c240f45d10166bcd901d99db78bb63147adda66e586d8dd505c6d608b54` on the tested pair.
+Verify: `sha256sum libnccl.so.2.30.7` → `e69a8c240f45d10166bcd901d99db78bb63147adda66e586d8dd505c6d608b54` on the reference pair.
 
 The injection and all striping env live in `scripts/tp2-env.sh` (`STRIPE=2` block). The non-obvious parts, already encoded there:
 - `NCCL_IB_SUBNET_AWARE_ROUTING=0` — **required**; the subnet-aware feature collapses parallel rails between the same rank pair onto one card.
@@ -424,7 +424,7 @@ passes).
 
 ## Known limitations
 
-Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the 3.9M-token pool caps that regime at roughly 29 streams at 131K or 14 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
+Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's model-card KLD measurements, taken on an RTX 5090; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the 3.9M-token pool caps that regime at roughly 29 streams at 131K or 14 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
 
 ## Credits
 

@@ -93,7 +93,7 @@ if [ -n "$railaddr" ]; then
         done
     fi
 fi
-[ -n "$RAILP" ] && note "rail prefix: $RAILP (from $railaddr)" || warn "no rail /24 found — striping needs per-cable subnets (see Phase 1)"
+[ -n "$RAILP" ] && note "rail prefix: $RAILP (from $railaddr)" || warn "no rail /24 found — striping needs per-cable subnets (see README.md Phase 1 — Fabric bring-up)"
 [ -n "$GIDX" ] && note "GID index: $GIDX (RoCE v2, matches $railaddr on $RDMA1)" || warn "could not resolve the GID index for the rail address"
 
 TP_D=2; [ -z "$FAB1" ] && TP_D=1

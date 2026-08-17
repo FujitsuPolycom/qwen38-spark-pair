@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared distributed-runtime environment for the two-Spark TP2 probe.
+# Shared distributed-runtime environment for two-Spark TP2 serving.
 # Sourced by the ray and serve scripts. RANK_IP must be set by the caller.
 # Site config: scripts/site.env if present, else the reference values below.
 [ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"

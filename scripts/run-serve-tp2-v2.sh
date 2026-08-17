@@ -2,7 +2,7 @@
 # TP2 serve for malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated across spark-aa42 + spark-931e.
 # Run inside the ggrun container on spark-aa42 AFTER ray head+worker are up.
 #
-# A/B gates. Bare defaults are the historical A/B baseline — the PRODUCTION
+# A/B gates. Bare defaults are the A/B baseline — the PRODUCTION
 # configuration is what start-stack.sh passes (TP=2 LMC=1 APC=1 STRIPE=2 MTPK=2
 # KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70):
 #   STAGE=graph|eager   graph = EXL3 CUDA-graph decode (validated 3/3 vs eager, +25%)

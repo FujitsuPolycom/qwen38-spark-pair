@@ -1,19 +1,22 @@
 #!/bin/bash
-# @reboot bootstrap for rank 0 (spark-aa42).
+# @reboot bootstrap for rank 0. Brings a cold or partially-up host to a serving
+# stack with the production configuration, in this order:
+#   container -> GPU visibility -> rail addresses -> ray head -> wait for rank 1
+#   -> cache servers (always cycled) -> wait for both to bind -> start-stack.sh.
 #
-# Rewritten after a real power event on 2026-08-17, where the previous version
-# reached the serve step and died with `CUDA error: invalid device ordinal`
-# because the container comes back from a reboot unable to see the GPU. It
-# would also have produced a misconfigured stack had it survived: it launched
-# the serve script with NO environment, so every gate fell back to its default
-# (APC off, MTP3, KV auto, batch 8192, LMCache off) and the cache servers were
-# never started at all.
-#
-# Sequence: container -> GPU visibility -> rails -> ray head -> wait for rank 1
-# -> cache server -> wait for rank 1's cache server -> start-stack.sh.
+# Invariants this ordering maintains:
+# - The GPU must be visible INSIDE the container before anything else: a
+#   container can come up after reboot with a dead NVML handle, which otherwise
+#   surfaces minutes later as `CUDA error: invalid device ordinal` at engine
+#   start. A container restart re-acquires the device.
+# - The engine must be launched through start-stack.sh with the full production
+#   environment: the serve script's bare defaults are an A/B baseline (no
+#   prefix caching, no LMCache, fp16 KV), not the production configuration.
+# - Cache servers are cycled, never reused: a surviving server holds a previous
+#   engine's KV cache through CUDA IPC and starves the next engine start.
 #
 # Idempotent: exits early if the endpoint already answers, so it is safe to run
-# by hand to test.  Installed via user crontab; no sudo required.
+# by hand. Installed via user crontab; no sudo required.
 
 exec > "$HOME/work/qwen38-exl3/logs/boot-aa42.log" 2>&1
 set -x

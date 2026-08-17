@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start ray head for the TP2 probe. Run inside ggrun on spark-aa42.
+# Start ray head for TP2 serving. Run inside ggrun on spark-aa42.
 # Site config: scripts/site.env if present, else the reference values below.
 [ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"
 set -u
