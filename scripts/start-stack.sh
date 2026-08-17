@@ -145,6 +145,30 @@ if [ "${STRIPE:-0}" != "0" ]; then
     pass "patched NCCL present on both ranks (STRIPE=$STRIPE)"
 fi
 
+# --- gate 6: ray must have been started WITH the striping env ---------------
+# NCCL runs inside the ray WORKERS, which inherit their environment from the
+# raylet at `ray start` time — not from the engine. A ray cluster started
+# without STRIPE produces a silent single-rail run that every other gate here
+# passes happily. Uses `strings` to read the NUL-separated environ.
+if [ "${STRIPE:-0}" != "0" ]; then
+    want_hca=$(docker exec "$C0" bash -c "STRIPE=$STRIPE RANK_IP=x . /ws/tp2-env.sh >/dev/null 2>&1; echo \$NCCL_IB_HCA" 2>/dev/null | tail -1)
+    # Scan EVERY raylet-matching pid: `pgrep -f raylet | head -1` can land on a
+    # stale/empty process and report the env as unset (false positive).
+    if [ -n "$want_hca" ]; then
+        got_hca=$(docker exec "$C0" bash -c 'for p in $(pgrep -f raylet); do strings /proc/$p/environ 2>/dev/null | sed -n "s/^NCCL_IB_HCA=//p"; done | sort -u | tail -1' 2>/dev/null)
+        if [ "$got_hca" != "$want_hca" ]; then
+            fail "ray was started WITHOUT the STRIPE=$STRIPE environment"
+            info "raylet has NCCL_IB_HCA='${got_hca:-unset}', expected '$want_hca'"
+            info "NCCL runs in the ray workers, which inherit this at 'ray start' time,"
+            info "so the engine's own STRIPE setting cannot fix it. Restart ray:"
+            info "  [r0] docker exec $C0 bash -c 'STRIPE=$STRIPE bash /ws/tp2-ray-head.sh'"
+            info "  [r1] docker exec $C1 bash -c 'STRIPE=$STRIPE bash /ws/tp2-ray-worker.sh'"
+            die 17 "transport would silently run single-rail"
+        fi
+        pass "ray carries the striping env (NCCL_IB_HCA=$got_hca)"
+    fi
+fi
+
 if [ "$CHECK_ONLY" = "1" ]; then
     step "All preconditions pass (--check: nothing launched)"
     exit 0
@@ -203,6 +227,19 @@ if [ "$LMC" = "1" ]; then
     else
         fail "lmcache heartbeat thread NOT started — cache lookups will silently stop in ~2.5 min"
         info "the engine is serving, but the KV cache tier is degraded"
+    fi
+fi
+
+# Prove the transport actually came up striped rather than trusting the env.
+if [ "${STRIPE:-0}" != "0" ]; then
+    case "$STRIPE" in 2) want_rails=2 ;; 1) want_rails=4 ;; *) want_rails=1 ;; esac
+    bound=$(grep -a "NET/IB : Using" "$LOG" 2>/dev/null | head -1             | grep -oE "\[[0-9]+\](rocep|roceP)[a-zA-Z0-9]*" | wc -l)
+    if [ "${bound:-0}" -ge "$want_rails" ]; then
+        pass "NCCL bound $bound rail(s), as STRIPE=$STRIPE expects"
+    else
+        fail "NCCL bound only ${bound:-0} rail(s); STRIPE=$STRIPE expects $want_rails"
+        info "$(grep -a 'NET/IB : Using' "$LOG" 2>/dev/null | head -1 | sed 's/.*NCCL INFO //')"
+        info "engine is serving but transport is degraded (~6% single-stream, ~7% prefill)"
     fi
 fi
 

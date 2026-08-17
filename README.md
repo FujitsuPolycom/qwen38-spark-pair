@@ -245,6 +245,7 @@ template.
 | "LMCache chunk size should be a multiple of vLLM block size" | Chunk must be 1600 for this model (server script already is). |
 | Cache stores work but replays never speed up | The heartbeat bug — you skipped Phase 8 step 2. Confirm with validation steps 3 and 6. |
 | Large replays return 0 hits though chunks exist on NVMe | L1 too small to stage the prefix (silent). Raise `--l1-size-gb` (~106 MB × chunks-per-prefix per rank). |
+| Striping configured but NCCL binds only one card | **`STRIPE` must be set when `ray start` runs, not when the engine starts.** NCCL executes inside the ray workers, which inherit their env from the raylet; the engine's own `STRIPE` has no effect on collectives. Confirm with `grep 'NET/IB : Using' <serve log>` — it must list one device per rail. `tp2-env.sh` defaults `STRIPE=2` for this reason; if you restart ray by hand, pass it explicitly. |
 | Striping shows 1 rail busy, others idle | `NCCL_IB_SUBNET_AWARE_ROUTING` still on, or rail /24s missing. |
 | −25–30% single-stream after enabling striping | Too many rails/channels (SM contention in decode graphs). 2 rails, 2 channels, one port per card. |
 | Throughput drops ~20% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
