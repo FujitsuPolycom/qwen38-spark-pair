@@ -22,6 +22,23 @@ This document is written to be executed by an LLM agent with SSH access to both 
 Copy the example config and fill in your hardware. **This is the only file you edit**; every
 script sources it and falls back to the reference pair's values when it is absent.
 
+**Easiest path — let it detect your hardware:**
+
+```bash
+bash scripts/detect-site.sh            # print what it finds, for review
+bash scripts/detect-site.sh --write    # write scripts/site.env
+```
+
+It probes containers, work dir, LAN and fabric addresses, ConnectX netdevs in PCI order, one
+RDMA device per card, the rail prefix, and the **RoCE v2** GID index (the same address also
+appears as RoCE v1 at a different index — picking that one yields a fabric that misbehaves
+rather than fails, so the detector filters by type). Anything it cannot determine is emitted as
+`REPLACE_WITH_*` and it exits non-zero, so a partial detection is obvious. On the reference pair
+it reproduces all 13 values correctly. **Review the output before using it** — it is a starting
+point, not an oracle.
+
+Or fill it in by hand:
+
 ```bash
 cp scripts/site.env.example scripts/site.env
 $EDITOR scripts/site.env
