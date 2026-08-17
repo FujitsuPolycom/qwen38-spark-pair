@@ -18,7 +18,11 @@
 set -uo pipefail
 
 # ---- site configuration ----------------------------------------------------
-RANK1_HOST="${RANK1_HOST:-198.18.200.2}"     # rank 1 over the fabric
+# Site config: scripts/site.env if present, else the reference values below.
+for _c in "$HOME/work/qwen38-exl3/site.env" "$(dirname "$0")/site.env"; do
+    [ -f "$_c" ] && . "$_c" && break
+done
+RANK1_HOST="${RANK1_HOST:-${FABRIC_RANK1:-198.18.200.2}}"     # rank 1 over the fabric
 C0="${C0:-ggrun}"                             # rank 0 serving container
 C1="${C1:-ggbuild}"                           # rank 1 serving container
 WS="${WS:-/home/code/work/qwen38-exl3}"       # host work dir (= /ws in container)

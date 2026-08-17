@@ -17,19 +17,30 @@ This document is written to be executed by an LLM agent with SSH access to both 
 - ~80 GB free disk per node (model + build trees + cache tier headroom; NVMe cache cap is configurable).
 - A LAN IP for each node and SSH between them.
 
-## Site values
+## Site values — edit one file
 
-Substitute these everywhere (files listed are in `scripts/`):
+Copy the example config and fill in your hardware. **This is the only file you edit**; every
+script sources it and falls back to the reference pair's values when it is absent.
 
-| Value (reference pair) | Meaning | Appears in |
+```bash
+cp scripts/site.env.example scripts/site.env
+$EDITOR scripts/site.env
+```
+
+| Setting | What it is | How to find it |
 |---|---|---|
-| `192.168.0.200` / `192.168.0.174` | rank0 / rank1 **LAN** IPs | `run-serve-tp2-v2.sh` (lmcache server_urls) |
-| `198.18.200.1` / `198.18.200.2` | rank0 / rank1 **fabric** IPs (any /30 or /24 on one direct cable) | `run-serve-tp2-v2.sh`, `tp2-ray-head.sh`, `tp2-ray-worker.sh` |
-| `10.42.{1..4}.0/24`, host `.1`/`.2` | per-cable rail subnets (rank0=.1, rank1=.2) | `boot-stack-aa42.sh`, `boot-worker-931e.sh` |
-| `enp1s0f0np0`, `enp1s0f1np1`, `enP2p1s0f0np0`, `enP2p1s0f1np1` | the four CX7 netdev names (check `ip -br link`) | boot scripts, `tp2-env.sh` |
-| `rocep1s0f0`, `roceP2p1s0f0` | RDMA device names of **one port on each card** (check `ibv_devices`; pairing ports of the same card is pointless — they share one PCIe x4 ≈ 110 Gb/s) | `tp2-env.sh` STRIPE=2 block |
-| `ggrun` (rank0) / `ggbuild` (rank1) | serving container names | boot scripts, all launch commands |
-| `/home/code/work/qwen38-exl3` | host work dir, bind-mounted as `/ws` | everywhere |
+| `TP` | 1 = single Spark, 2 = a pair | — |
+| `C0` / `C1` | serving container names | your choice at Phase 2 |
+| `WS` | host work dir, mounted as `/ws` | your choice |
+| `LAN_RANK0` / `LAN_RANK1` | LAN IPs (LMCache server URLs) | `ip -br addr` |
+| `FABRIC_RANK0` / `FABRIC_RANK1` | point-to-point IPs on one direct cable **[2x]** | Phase 1 |
+| `NETDEV1..4` | the four ConnectX-7 netdevs, cable order **[2x]** | `ip -br link` |
+| `RDMA_CARD1` / `RDMA_CARD2` | RDMA device for **one port on each card** **[2x]** | `ibv_devices` |
+| `NCCL_GID_INDEX` | GID index holding the per-cable /24 **[2x]** | `cat /sys/class/infiniband/<dev>/ports/1/gids/<n>` |
+| `RAIL_PREFIX` | per-cable rail subnets **[2x]** | your choice |
+
+Settings marked **[2x]** are irrelevant with `TP=1` — a single node needs no fabric, no striping
+and no second cache server.
 
 Convention below: **[r0]** = run on rank0 host, **[r1]** = rank1, **[both]** = both. Container commands are `docker exec <container> bash -c "..."` with the work dir at `/ws`.
 

@@ -13,11 +13,13 @@
 #   TP=2                1 = single Spark (drops ray, striping, rank-1 cache server;
 #                       expect ~17 tok/s decode, ~700 prefill, ~1.65M KV @ GPUMEM=0.70)
 #   KVDTYPE=auto        fp8 = FP8 KV cache (community: avoids -33% long-depth penalty)
+# Site config: scripts/site.env if present, else the reference values below.
+[ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"
 set -u
 . /ws/venv/bin/activate
 TP="${TP:-2}"          # 1 = single Spark: no ray, no striping, one cache server
 if [ "$TP" -gt 1 ]; then
-  RANK_IP=198.18.200.1 . /ws/tp2-env.sh
+  RANK_IP="${FABRIC_RANK0:-198.18.200.1}" . /ws/tp2-env.sh
 fi
 
 STAGE="${STAGE:-graph}"
@@ -41,9 +43,9 @@ if [ "${LMC:-0}" = "1" ]; then
   export LMCACHE_DISABLE_BANNER=1
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
   if [ "$TP" -gt 1 ]; then
-    SERVER_URLS='["tcp://192.168.0.200:6556","tcp://192.168.0.174:6556"]'
+    SERVER_URLS="[\"tcp://${LAN_RANK0:-192.168.0.200}:6556\",\"tcp://${LAN_RANK1:-192.168.0.174}:6556\"]"
   else
-    SERVER_URLS='["tcp://192.168.0.200:6556"]'
+    SERVER_URLS="[\"tcp://${LAN_RANK0:-192.168.0.200}:6556\"]"
   fi
   EXTRA+=(--kv-transfer-config "{\"kv_connector\":\"LMCacheMPConnector\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"lmcache.mp.server_urls\":$SERVER_URLS,\"lmcache.mp.mq_timeout\":60,\"lmcache.mp.heartbeat_interval\":10}}")
 fi

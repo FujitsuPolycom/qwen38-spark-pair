@@ -1,9 +1,11 @@
 #!/bin/bash
 # Shared distributed-runtime environment for the two-Spark TP2 probe.
 # Sourced by the ray and serve scripts. RANK_IP must be set by the caller.
-export NCCL_SOCKET_IFNAME=enp1s0f0np0
-export GLOO_SOCKET_IFNAME=enp1s0f0np0
-export NCCL_IB_HCA=rocep1s0f0:1
+# Site config: scripts/site.env if present, else the reference values below.
+[ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"
+export NCCL_SOCKET_IFNAME="${NETDEV1:-enp1s0f0np0}"
+export GLOO_SOCKET_IFNAME="${NETDEV1:-enp1s0f0np0}"
+export NCCL_IB_HCA="${RDMA_CARD1:-rocep1s0f0}:1"
 export NCCL_IB_GID_INDEX=3
 export NCCL_DEBUG=INFO
 export VLLM_HOST_IP=${RANK_IP:?set RANK_IP to this node fabric IP}
@@ -22,8 +24,8 @@ if [ "$STRIPE" = "1" ]; then
   export LD_PRELOAD=/ws/nccl-patched/libnccl.so.2
   export VLLM_NCCL_SO_PATH=/ws/nccl-patched/libnccl.so.2
   export NCCL_NET=IB
-  export NCCL_IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1
-  export NCCL_IB_GID_INDEX=5
+  export NCCL_IB_HCA="${RDMA_CARD1:-rocep1s0f0},rocep1s0f1,${RDMA_CARD2:-roceP2p1s0f0},roceP2p1s0f1"
+  export NCCL_IB_GID_INDEX="${NCCL_GID_INDEX:-5}"
   export NCCL_IB_MERGE_NICS=0
   export NCCL_CROSS_NIC=1
   export NCCL_IB_SUBNET_AWARE_ROUTING=0
@@ -41,8 +43,8 @@ if [ "$STRIPE" = "2" ]; then
   export LD_PRELOAD=/ws/nccl-patched/libnccl.so.2
   export VLLM_NCCL_SO_PATH=/ws/nccl-patched/libnccl.so.2
   export NCCL_NET=IB
-  export NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0
-  export NCCL_IB_GID_INDEX=5
+  export NCCL_IB_HCA="${RDMA_CARD1:-rocep1s0f0},${RDMA_CARD2:-roceP2p1s0f0}"
+  export NCCL_IB_GID_INDEX="${NCCL_GID_INDEX:-5}"
   export NCCL_IB_MERGE_NICS=0
   export NCCL_CROSS_NIC=1
   export NCCL_IB_SUBNET_AWARE_ROUTING=0
