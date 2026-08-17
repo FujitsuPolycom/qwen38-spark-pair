@@ -178,9 +178,9 @@ fi
 step "Launching engine"
 info "LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM"
 info "log: $LOG"
-# The container writes this file as root, so truncating from the host may be
-# denied; the redirect below truncates it anyway.
-: > "$LOG" 2>/dev/null || true
+# No host-side truncate: the file is root-owned inside the container, and bash
+# reports a failed `>` before any `2>/dev/null` on the same line can suppress
+# it. The container's own redirect below truncates it as root regardless.
 docker exec -d "$C0" bash -c \
     "LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM bash /ws/run-serve-tp2-v2.sh > ${LOG/$WS//ws} 2>&1"
 
