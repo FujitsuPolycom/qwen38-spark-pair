@@ -125,7 +125,10 @@ pip install dist/*.whl --no-deps
 ```
 cd /ws/src && git clone https://github.com/local-inference-lab/vllm vllm-gg && cd vllm-gg
 git checkout fa033bd4e                     # dev/gilded-gnosis pin
-git fetch origin pull/318/head:pr318 && git merge pr318   # perf stack (⊇ #316 ⊇ #314); merges clean
+git fetch origin pull/318/head:pr318
+git merge 2b96dad45                        # PR-318 head as tested (⊇ #316 ⊇ #314); merges clean
+# PR 318 is still open — merging `pr318` instead takes whatever its head is today,
+# which may not be the state these numbers were measured on.
 git am /ws/patches/fork-ports.patch        # our two ports: vLLM #51113 + #48425 (see below)
 TORCH_CUDA_ARCH_LIST="12.0f" pip install -e . --no-build-isolation   # 12.0f REQUIRED (see troubleshooting)
 ```
@@ -135,6 +138,14 @@ The two ports in `fork-ports.patch` are **not optional**:
 - **#48425 port** — per-group prefix-hit divergence reconcile. Without it, LMCache + KV-pressure eviction can resume generation on stale mamba state (silent token salad; see [LMCache issue #4247](https://github.com/LMCache/LMCache/issues/4247)).
 
 **Verify:** `python -c "import vllm; print(vllm.__version__)"`; `cd /ws/src/vllm-gg && python -m pytest tests/v1/core/test_scheduler.py -q` → expect 129/130 (one known order-dependent flake).
+
+### Pins, verified 2026-08-17
+
+Every external reference in this recipe resolved on that date: fork base `fa033bd4e`,
+PR-318 head `2b96dad45`, exllamav3 `5f3c537`, lmcache `0.5.2` on PyPI (latest is 0.5.3 —
+0.5.2 is deliberate, the heartbeat patch is written against it), the sparkring repository,
+and the Hugging Face checkpoint. If a build fails at one of these, check whether the pin
+moved before debugging anything else.
 
 ## Phase 5 — Model + template
 
