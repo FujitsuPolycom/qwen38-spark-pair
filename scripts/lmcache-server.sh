@@ -1,10 +1,9 @@
 #!/bin/bash
-# Per-rank LMCache MP server (CS512 profile, adapted from the sparkring GLM lane).
+# Per-rank LMCache MP server — CS1600 profile (chunk 1600 = this model's mamba block).
 # Usage: RANK=0|1 bash /ws/lmcache-server.sh   (inside the rank's container)
-# Tiering is GB10-aware: tiny lazy L1 (1 GB, lives in unified memory) and the
-# L1 8 GB (>= longest replayed prefix; chunk = 106 MB/rank at TP2, 213 MB at TP1).
-# L2 fs_native on NVMe, odirect off (either works; see recipe README).
-# unified memory too).
+# Tiering: 8 GB lazy L1 in unified memory (must cover the longest replayed prefix —
+# chunks are 106 MB/rank at TP2, 213 MB at TP1, so 8 GB = ~118K / ~59K tokens) plus
+# fs_native L2 on NVMe (200 GB, buffered I/O; odirect also works).
 set -u
 . /ws/venv/bin/activate
 export LMCACHE_DISABLE_BANNER=1

@@ -2,7 +2,7 @@
 
 **A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on 2× NVIDIA DGX Spark (GB10) at TP2**, with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, 2-rail RoCE striping, prefix caching, and an LMCache L1+NVMe KV tier.
 
-Measured on the reference pair: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,400 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+Measured on the reference pair: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
 
 This document is written to be executed by an LLM agent with SSH access to both Sparks. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
@@ -167,7 +167,23 @@ The two ports in `fork-ports.patch` are **not optional**:
 
 ### Pins, verified 2026-08-17
 
-Every external reference in this recipe resolved on that date: fork base `fa033bd4e`,
+Every external reference in this recipe resolved on that date. Full identities:
+
+| Pin | Value |
+|---|---|
+| engine mirror (path A) | `FujitsuPolycom/vllm` tag `qwen38-tested-20260817` = `229effc810ee` |
+| fork base | `fa033bd4e1b16d9d729ad94be2d87da5a13210ce` |
+| PR-318 head as tested | `2b96dad45b2c9a1dd59b4bf3f9f33b06cb70f42a` |
+| exllamav3 | `5f3c537` |
+| torch / torchvision | `2.12.0+cu132` / `0.27.0+cu132` from `download.pytorch.org/whl/cu132` |
+| CUDA toolkit | 13.2.86 (meta-package floats within 13.2.x) |
+| lmcache | `0.5.2` from PyPI (0.5.3 exists; 0.5.2 is deliberate — the heartbeat patch targets it) |
+| sparkring (NCCL stage) | `4545c4ec4740f203d4f427db265414a34bd8f5db` |
+| patched NCCL artifact | sha256 `e69a8c240f45d10166bcd901d99db78bb63147adda66e586d8dd505c6d608b54` |
+| HF checkpoint revision | `ab3a91a13813df8096cb4c1d560ed3669035d0cf` |
+| base image | `nvcr.io/nvidia/cuda@sha256:5c36750138dc1447a17dafbb397674f167d3b44ce18d9160d769df114577b35d` |
+
+Shorthand used in the phases: fork base `fa033bd4e`,
 PR-318 head `2b96dad45`, exllamav3 `5f3c537`, lmcache `0.5.2` on PyPI (latest is 0.5.3 —
 0.5.2 is deliberate, the heartbeat patch is written against it), the sparkring repository,
 and the Hugging Face checkpoint. If a build fails at one of these, check whether the pin
@@ -333,7 +349,7 @@ block, so this deployment uses **1600**. What that costs in bytes depends on ten
 because each rank stores only its share of the KV heads:
 
 ```
-chunk bytes per rank = 65 layers x 2 (K,V) x 1600 tokens x 512 B / TP
+chunk bytes per rank = 65 layers x 2 (K,V) x 1600 tokens x 1024 B / TP
 ```
 
 | | bytes per chunk, per rank | replayable tokens per GB of L1 |
@@ -372,6 +388,12 @@ Two operational rules that follow from the above:
 
 ## Phase 10 — Validation gauntlet
 
+The companion profile ships an automated version of these checks:
+[`test_correctness.py`](https://github.com/FujitsuPolycom/inference-runtime-profiles/blob/master/profiles/qwen38-27b-exl3-k5k6-mtp2-lmcache-2x-spark/test_correctness.py)
+(byte-exactness, cache-hit, and a separate `--stage heartbeat` that must run **>4 minutes after
+engine start** — the one gate that catches the heartbeat bug, which every immediate-replay test
+passes).
+
 1. **Liveness:** `curl http://<rank0-lan>:8000/v1/models`.
 2. **Exactness:** a few greedy (`temperature 0`) probes — arithmetic, instruction-following. Re-run each twice: byte-identical.
 3. **Heartbeat (the fix from Phase 8 working):** engine log contains `Started PeriodicThread: lmcache-heartbeat`; server logs show **no** `Reaped GPU instance` while the engine lives.
@@ -394,7 +416,7 @@ Two operational rules that follow from the above:
 | Striping configured but NCCL binds only one card | **`STRIPE` must be set when `ray start` runs, not when the engine starts.** NCCL executes inside the ray workers, which inherit their env from the raylet; the engine's own `STRIPE` has no effect on collectives. Confirm with `grep 'NET/IB : Using' <serve log>` — it must list one device per rail. `tp2-env.sh` defaults `STRIPE=2` for this reason; if you restart ray by hand, pass it explicitly. |
 | Striping shows 1 rail busy, others idle | `NCCL_IB_SUBNET_AWARE_ROUTING` still on, or rail /24s missing. |
 | −25–30% single-stream after enabling striping | Too many rails/channels (SM contention in decode graphs). 2 rails, 2 channels, one port per card. |
-| Throughput drops ~20% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
+| Throughput drops ~18% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
 | NCCL probe shows ~2.3 ms latency floor | You benchmarked beside the live engine — GB10 context timeslicing phantom. Quiesce first. |
 | Container loses the GPU: `Failed to initialize NVML: Unknown Error` (often after `systemctl daemon-reload`) | Known NVIDIA container-toolkit issue with cgroups v2 + systemd driver ([#48](https://github.com/NVIDIA/nvidia-container-toolkit/issues/48)). **Prevent it** with `sudo nvidia-ctk system create-dev-char-symlinks --create-all` at boot. `docker restart <container>` recovers a container that has already lost access; `scripts/boot-stack-aa42.sh` detects and does this automatically. |
 | Engine won't start: `Free memory on device cuda:0 (N/121 GiB) ... less than desired GPU memory utilization` | The cache servers are still holding the **previous** engine's KV cache through CUDA IPC — check `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` for an `lmcache` PID holding tens of GB with tiny RSS. Restart the cache servers to release it. Correct restart order is always **kill engine -> cycle cache servers -> start engine**. |
@@ -402,7 +424,7 @@ Two operational rules that follow from the above:
 
 ## Known limitations
 
-Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the KV pool caps that regime at roughly 14 streams at 131K or 7 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
+Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the 3.9M-token pool caps that regime at roughly 29 streams at 131K or 14 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
 
 ## Credits
 

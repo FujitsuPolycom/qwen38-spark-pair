@@ -6,6 +6,8 @@
 export NCCL_SOCKET_IFNAME="${NETDEV1:-enp1s0f0np0}"
 export GLOO_SOCKET_IFNAME="${NETDEV1:-enp1s0f0np0}"
 export NCCL_IB_HCA="${RDMA_CARD1:-rocep1s0f0}:1"
+# GID 3 = RoCE v2 entry of the /30 fabric address — used only by the unstriped
+# (STRIPE=0) fallback; the STRIPE blocks below use the rail /24's GID instead.
 export NCCL_IB_GID_INDEX=3
 export NCCL_DEBUG=INFO
 export VLLM_HOST_IP=${RANK_IP:?set RANK_IP to this node fabric IP}

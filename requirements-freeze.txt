@@ -1,3 +1,7 @@
+# pip freeze of the tested venv (2026-08-17). Four entries are locally built and
+# will not resolve from an index — ignore them when diffing: the editable vllm
+# fork (0.1.dev19076+g3e6393ae6), exllamav3 (local aarch64 wheel), and any
+# file:// / editable lines. Everything else should match exactly.
 aiofile==3.12.3
 aiofiles==25.1.0
 aiohappyeyeballs==2.7.1
