@@ -86,7 +86,20 @@ docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
 ```
 
 2. [both] In-container deps: `apt-get update && apt-get install -y python3 python3-dev python3-venv git cmake ninja-build ccache && apt-get install -y cuda-toolkit-13-2` — **the CUDA 13.2 toolkit is required** (13.0 base cannot build the fork's kernels).
-3. [both, optional] NET_ADMIN helper for sudo-less rail IPs at boot: `docker run -d --name netadm --restart unless-stopped --network host --cap-add NET_ADMIN ubuntu:24.04 sleep infinity`.
+3. [both] **Prevent the container from losing its GPU.** With cgroups v2 and the systemd driver,
+   containers can lose access to the NVIDIA devices (`Failed to initialize NVML: Unknown Error`,
+   surfacing later as `CUDA error: invalid device ordinal`), often triggered by
+   `systemctl daemon-reload` ([nvidia-container-toolkit#48](https://github.com/NVIDIA/nvidia-container-toolkit/issues/48)).
+   Apply NVIDIA's fix once, and make it run at boot:
+
+```bash
+sudo nvidia-ctk system create-dev-char-symlinks --create-all
+```
+
+   `boot-stack-aa42.sh` also detects the condition and restarts the container, but preventing it
+   is better than recovering from it — the recovery costs a restart cycle and only fires at boot.
+
+4. [both, optional] NET_ADMIN helper for sudo-less rail IPs at boot: `docker run -d --name netadm --restart unless-stopped --network host --cap-add NET_ADMIN ubuntu:24.04 sleep infinity`.
 
 **Verify:** `docker exec <c> nvcc --version` reports 13.2; `docker exec <c> ls /dev/infiniband` shows uverbs devices.
 
