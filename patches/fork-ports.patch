@@ -1,0 +1,511 @@
+From 7b216dc1de9c7858f8599644814d9d9ce172d0e3 Mon Sep 17 00:00:00 2001
+From: Yifan Qiao <yifanqiao@inferact.ai>
+Date: Thu, 6 Aug 2026 10:21:00 -0700
+Subject: [PATCH 1/2] [Bugfix] Keep mamba align prefill chunks block-aligned
+ past last_cache_position (#51113)
+
+Signed-off-by: Yifan Qiao <yifanqiao@inferact.ai>
+Co-authored-by: Hernan <kodek@eat1337.com>
+Co-authored-by: yanghui1-arch <3053034939@qq.com>
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+---
+ tests/v1/core/test_mamba_align_chunk_split.py | 247 ++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               |  39 +--
+ 2 files changed, 270 insertions(+), 16 deletions(-)
+ create mode 100644 tests/v1/core/test_mamba_align_chunk_split.py
+
+diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
+new file mode 100644
+index 000000000..31671caf7
+--- /dev/null
++++ b/tests/v1/core/test_mamba_align_chunk_split.py
+@@ -0,0 +1,247 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Mamba "align" prefill chunk splitting (`_mamba_block_aligned_split`).
++
++Invariant: slot `p` holds the state after exactly `(p + 1) * block_size` tokens.
++State is written at chunk ends, so a chunk ending mid-block leaves its slot at
++the wrong offset, and a later chunk crossing that boundary publishes it anyway.
++Requests resuming from it then restore a truncated state (#43559).
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.utils.math_utils import cdiv
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++from vllm.v1.request import Request
++
++from .utils import create_requests
++
++pytestmark = pytest.mark.cpu_test
++
++# Mirrors the deployment where the poisoning was observed (Qwen3.6-27B): mamba
++# block 1600, MTP with 3 draft tokens, prompts shorter than 2 mamba blocks.
++ATTN_BLOCK_SIZE = 16
++MAMBA_BLOCK_SIZE = 1600
++NUM_SPEC = 3
++PROMPT_LEN = 2002
++MAMBA_GROUP_ID = 1
++
++
++def _make_hybrid_kv_cache_manager() -> KVCacheManager:
++    config = KVCacheConfig(
++        num_blocks=10000,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full_layer"],
++                FullAttentionSpec(
++                    block_size=ATTN_BLOCK_SIZE,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba_layer"],
++                MambaSpec(
++                    block_size=MAMBA_BLOCK_SIZE,
++                    shapes=((1, 1),),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    num_speculative_blocks=NUM_SPEC,
++                ),
++            ),
++        ],
++    )
++    return KVCacheManager(
++        config,
++        max_model_len=262144,
++        scheduler_block_size=MAMBA_BLOCK_SIZE,
++        hash_block_size=ATTN_BLOCK_SIZE,
++        enable_caching=True,
++        use_eagle=True,
++    )
++
++
++def _split(
++    request: Request,
++    num_new_tokens: int,
++    use_eagle: bool = True,
++    partial_hit: bool = False,
++) -> int:
++    """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
++    stub = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
++        use_eagle=use_eagle,
++        max_num_scheduled_tokens=16384,
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
++        # `prefix_match_unit` finer than the block size (#46384).
++        mamba_partial_cache_hit=partial_hit,
++        hash_block_size=ATTN_BLOCK_SIZE,
++    )
++    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
++
++
++def _run_chunked_prefill(
++    manager: KVCacheManager, request: Request, budgets: list[int]
++) -> dict[int, int]:
++    """Prefill `request`, one step per entry in `budgets`.
++
++    A zero-token split means the budget cannot fund an aligned chunk; the
++    scheduler defers the request to a later step, so this does too.
++
++    Returns physical mamba block id -> the token offset of the state it holds,
++    mirroring the GDN kernel: the running slot ends up at the chunk end.
++    """
++    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++    state_at: dict[int, int] = {}
++    # `budgets` fragments the first steps; afterwards the request is alone and
++    # gets as much as it can use, so the prefill always finishes.
++    for step in range(len(budgets) + 64):
++        computed = request.num_computed_tokens
++        if computed >= request.num_tokens:
++            break
++        budget = budgets[step] if step < len(budgets) else request.num_tokens
++        num_new = _split(request, min(request.num_tokens - computed, budget))
++        if num_new == 0:
++            continue
++        assert (
++            manager.allocate_slots(request, num_new, num_lookahead_tokens=NUM_SPEC)
++            is not None
++        )
++        request.num_computed_tokens = computed + num_new
++        blocks = mamba_manager.req_to_blocks[request.request_id]
++        running = cdiv(request.num_computed_tokens, MAMBA_BLOCK_SIZE) - 1
++        state_at[blocks[running].block_id] = request.num_computed_tokens
++    return state_at
++
++
++def _count_cached_boundary_states(
++    manager: KVCacheManager, request: Request, state_at: dict[int, int]
++) -> int:
++    """Assert every hash-cached mamba slot holds the state its hash claims.
++
++    Covers both full-block snapshots (`(p + 1) * block_size`) and the
++    partial-tail entries align mode registers at an exact token count.
++
++    Returns the number of cached slots checked.
++    """
++    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++    checked = 0
++    for pos, block in enumerate(mamba_manager.req_to_blocks[request.request_id]):
++        if block.is_null or block.block_hash is None:
++            continue
++        claimed = block.block_hash_num_tokens
++        assert state_at.get(block.block_id) == claimed, (
++            f"mamba slot {pos} is hashed as state@{claimed} but holds "
++            f"state@{state_at.get(block.block_id)}"
++        )
++        checked += 1
++    return checked
++
++
++def _prefill(prompt_len: int, budgets: list[int]) -> int:
++    manager = _make_hybrid_kv_cache_manager()
++    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
++    state_at = _run_chunked_prefill(manager, request, budgets)
++    assert request.num_computed_tokens == prompt_len, "prefill did not complete"
++    return _count_cached_boundary_states(manager, request, state_at)
++
++
++def test_fragmented_first_chunk_does_not_poison_mamba_prefix_cache() -> None:
++    """EAGLE zeroes `last_cache_position` for prompts under two blocks.
++
++    Past that point any chunk end used to be accepted, so a short first chunk
++    (concurrent prefills sharing the budget) left slot 0 at state@364 while the
++    next chunk crossed 1600 and published slot 0 as state@1600.
++    """
++    _prefill(PROMPT_LEN, budgets=[364, PROMPT_LEN])
++
++
++def test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache() -> None:
++    """Same poisoning one block in, where a hit is still cacheable.
++
++    `last_cache_position` is 1600, so the chunk ending there is cached. The next
++    chunk used to be free to stop mid-block (slot 1 at state@2600) and the one
++    after it crossed 3200, publishing slot 1 as state@3200.
++    """
++    assert _prefill(3602, budgets=[1600, 1000, 3602]) > 0
++
++
++@pytest.mark.parametrize("first_chunk", [800, 900, 1599, 1601, 2000])
++def test_intermediate_chunk_ends_stay_block_aligned(first_chunk: int) -> None:
++    """Every non-final prefill chunk must end on a mamba block boundary."""
++    _prefill(PROMPT_LEN, budgets=[first_chunk, PROMPT_LEN, PROMPT_LEN])
++
++
++@pytest.mark.parametrize(
++    ("block_size", "prompt_len", "budgets"),
++    [
++        # Kimi-K3-scale mamba blocks: TP8 shards the recurrent state 8 ways
++        # (~1.5k block), DEP16 keeps it whole (~12k block). The first budget
++        # walks the request up to `last_cache_position`; the second is the
++        # sub-block fragment that lands in the unguarded tail region.
++        (1536, 30000, [27648, 1024, 30000]),
++        (12288, 30000, [12288, 4000, 30000]),
++        (12288, 41000, [24576, 8000, 41000]),
++    ],
++)
++def test_poisoning_is_block_size_independent(
++    monkeypatch: pytest.MonkeyPatch,
++    block_size: int,
++    prompt_len: int,
++    budgets: list[int],
++) -> None:
++    """The invariant is per-block, so large mamba blocks are not safer."""
++    import sys
++
++    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
++    assert _prefill(prompt_len, budgets=budgets) > 0
++
++
++@pytest.mark.parametrize("partial_hit", [False, True])
++@pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
++def test_unaligned_resume_never_runs_past_its_block(
++    partial_hit: bool, resume_at: int
++) -> None:
++    """A prefill resuming mid-block must re-align before crossing a boundary.
++
++    Reachable with a finer `prefix_match_unit` (its partial-tail stop ends a
++    chunk off-grid by design) and with unaligned external tokens from a KV
++    connector.
++    """
++    prompt_len = 3602
++    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
++    tail_boundary = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
++
++    pos, ends = resume_at, []
++    while pos < prompt_len:
++        request.num_computed_tokens = pos
++        num_new = _split(request, prompt_len - pos, partial_hit=partial_hit)
++        assert num_new > 0, f"no progress at {pos}"
++        if pos % MAMBA_BLOCK_SIZE != 0:
++            block_end = (pos // MAMBA_BLOCK_SIZE + 1) * MAMBA_BLOCK_SIZE
++            assert pos + num_new <= block_end, (
++                f"chunk [{pos}, {pos + num_new}) starts mid-block and runs past "
++                f"{block_end}; the slot holding state@{pos} gets hashed as "
++                f"state@{block_end}"
++            )
++        pos += num_new
++        ends.append(pos)
++
++    for end in ends[:-1]:
++        aligned = end % MAMBA_BLOCK_SIZE == 0
++        assert aligned or (partial_hit and end == tail_boundary), (
++            f"intermediate chunk end {end} is neither block-aligned nor the "
++            f"partial-tail boundary"
++        )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 208b5a679..d106921db 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -370,10 +370,11 @@ class Scheduler(SchedulerInterface):
+     ) -> int:
+         """Clip a prefill chunk so it ends where Mamba state must be cached.
+ 
+-        In "align" cache mode the SSM state is only materialized at chunk
+-        ends, so chunk ends are steered onto cacheable positions: block
+-        boundaries by default, plus mandatory early stops (the prompt's
+-        partial-tail hash boundary, a detected shared-prefix junction).
++        In "align" cache mode reusable SSM states are materialized at block
++        boundaries, plus mandatory early stops (the prompt's partial-tail hash
++        boundary, a detected shared-prefix junction). If a block is larger
++        than the configured prefill chunk limit, intermediate chunks keep
++        private running state until they reach the next cacheable position.
+         """
+         start = (
+             request.num_computed_tokens
+@@ -382,7 +383,8 @@ class Scheduler(SchedulerInterface):
+         )
+         # Split only during prefill: `request.num_tokens - 1` extends this to
+         # resumed requests replaying their output tokens.
+-        if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
++        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
++        if start >= prefill_end:
+             return num_new_tokens
+ 
+         block_size = self.cache_config.block_size
+@@ -394,11 +396,19 @@ class Scheduler(SchedulerInterface):
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+-        # Until `last_cache_position`, chunk ends must land on block
+-        # boundaries. May yield an empty chunk (budget cannot reach the next
+-        # boundary); the caller then skips the request.
+-        if end < last_cache_position:
+-            end = end // block_size * block_size
++        # Invariant: slot p holds the state after exactly (p + 1) * block_size
++        # tokens. State is written at chunk ends, so chunk ends must be block
++        # aligned. Exempt: the prompt's last chunk, whose slot decode advances
++        # to the boundary. A block too wide for one chunk advances sub-block
++        # and re-aligns at the next boundary.
++        if end < prefill_end:
++            max_prefill_tokens = self.max_num_scheduled_tokens
++            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
++            if long_prefill_threshold > 0:
++                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
++            aligned_end = end // block_size * block_size
++            if aligned_end > start or block_size <= max_prefill_tokens:
++                end = aligned_end
+ 
+         next_block_boundary = (start // block_size + 1) * block_size
+         tail_boundary = (
+@@ -407,12 +417,9 @@ class Scheduler(SchedulerInterface):
+             else 0
+         )
+         stops = (
+-            # Resumed mid-block (fine-grained partial hash hit): re-align to
+-            # the block grid before running on, so the crossed boundary's
+-            # state is materialized (unless it is past the cacheable range).
+-            next_block_boundary
+-            if start % block_size != 0 and next_block_boundary <= last_cache_position
+-            else 0,
++            # Same invariant: a chunk starting mid-block stops at the boundary
++            # rather than running past it.
++            next_block_boundary if start % block_size != 0 else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+             # Fine-grained hits: the prompt's partial-tail entry can only be
+-- 
+2.43.0
+
+
+From 229effc810ee6b8112f661472f6aace4eb8c787d Mon Sep 17 00:00:00 2001
+From: spark-dev <dev@local>
+Date: Mon, 17 Aug 2026 10:05:36 -0500
+Subject: [PATCH 2/2] Port vLLM #48425: reconcile per-group prefix-hit
+ divergence for hybrid models with KV connector
+
+Hand-adapted to the gg-perf-mtp scheduler (fork-style branch with stats
+recording preserved; manager helper inlined scheduler-side). Closes the
+stale-mamba-state corruption window under KV-pressure eviction with
+LMCacheMPConnector (LMCache issue 4247).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ vllm/v1/core/kv_cache_coordinator.py |  9 +++
+ vllm/v1/core/sched/scheduler.py      | 96 +++++++++++++++++++++-------
+ 2 files changed, 82 insertions(+), 23 deletions(-)
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 8731c4e3c..d091c4ef9 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -755,6 +755,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             key=lambda g: not isinstance(g.spec, FullAttentionSpec)
+         )
+ 
++        # Dense reference group for per-group lookups (None when the model
++        # has no full-attention layers): full attention is downward-closed,
++        # so any group reporting a longer per-group hit implies the union of
++        # per-group hits is not consistent at a single boundary (#46453).
++        first = self.attention_groups[0]
++        self.full_attention_group_id: int | None = (
++            first.group_ids[0] if isinstance(first.spec, FullAttentionSpec) else None
++        )
++
+         # Propagate the eagle bit to each manager (default to ``use_eagle=False``).
+         for group in self.attention_groups:
+             if group.use_eagle:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d106921db..6aa82f6bd 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -732,6 +732,7 @@ class Scheduler(SchedulerInterface):
+ 
+                 # Get already-cached tokens.
+                 if request.num_computed_tokens == 0:
++                    hit_diverged = False
+                     # Get locally-cached tokens.
+                     if (
+                         self.connector is not None
+@@ -740,35 +741,73 @@ class Scheduler(SchedulerInterface):
+                             self.kv_cache_manager.coordinator,
+                             HybridKVCacheCoordinator,
+                         )
++                        # Full attention is downward-closed, so per-group
++                        # divergence is only resolvable against an FA
++                        # reference group (vLLM #48425 / #46453 port).
++                        and self.kv_cache_manager.coordinator.full_attention_group_id
++                        is not None
+                     ):
++                        coordinator = self.kv_cache_manager.coordinator
+                         computed, per_group_hits = (
+-                            self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
++                            coordinator.find_longest_cache_hit_per_group(
+                                 request.block_hashes, request.num_tokens - 1
+                             )
+                         )
+-                        new_computed_blocks = (
+-                            self.kv_cache_manager.create_kv_cache_blocks(computed)
+-                        )
+-                        # NOTE(ZhanqiuHu): For Mamba hybrid models,
+-                        # num_new_local_computed_tokens should be the FA hit
+-                        # length. This value is passed to the connector's
+-                        # get_num_new_matched_tokens which computes:
+-                        # external = total - local_computed.
+-                        # Using the FA hit skips re-transferring FA blocks
+-                        # already cached on D-side. The Mamba state (always
+-                        # the last block) is transferred unconditionally by
+-                        # _apply_prefix_caching in nixl/worker.py.
+-                        num_new_local_computed_tokens = max(per_group_hits)
+-                        # The per-group lookup does not detect an uncached shared
+-                        # prefix, so there is no junction to pin in this path.
+-                        request.shared_prefix_boundary = 0
+-                        if self.kv_cache_manager.log_stats:
+-                            assert self.kv_cache_manager.prefix_cache_stats is not None
+-                            self.kv_cache_manager.prefix_cache_stats.record(
+-                                num_tokens=request.num_tokens,
+-                                num_hits=num_new_local_computed_tokens,
+-                                preempted=request.num_preemptions > 0,
++                        fa_group_id = coordinator.full_attention_group_id
++                        if any(
++                            hit > per_group_hits[fa_group_id]
++                            for hit in per_group_hits
++                        ):
++                            # A lagging group hit deeper than full attention
++                            # means FA blocks were evicted; use the reconciled
++                            # boundary every group agrees on (#48425 port).
++                            (
++                                new_computed_blocks,
++                                num_new_local_computed_tokens,
++                                request.shared_prefix_boundary,
++                            ) = self.kv_cache_manager.get_computed_blocks(request)
++                        else:
++                            new_computed_blocks = (
++                                self.kv_cache_manager.create_kv_cache_blocks(
++                                    computed
++                                )
+                             )
++                            # NOTE(ZhanqiuHu): For Mamba hybrid models,
++                            # num_new_local_computed_tokens should be the FA hit
++                            # length. This value is passed to the connector's
++                            # get_num_new_matched_tokens which computes:
++                            # external = total - local_computed.
++                            # Using the FA hit skips re-transferring FA blocks
++                            # already cached on D-side. The Mamba state (always
++                            # the last block) is transferred unconditionally by
++                            # _apply_prefix_caching in nixl/worker.py.
++                            num_new_local_computed_tokens = per_group_hits[
++                                fa_group_id
++                            ]
++                            # The per-group lookup does not detect an uncached
++                            # shared prefix, so there is no junction to pin in
++                            # this path.
++                            request.shared_prefix_boundary = 0
++                            # An FA hit deeper than a lagging group only has a
++                            # valid Mamba state at its boundary if the connector
++                            # supplies it; flag so the ext==0 case reconciles
++                            # below (#48425 port).
++                            hit_diverged = (
++                                min(per_group_hits)
++                                < num_new_local_computed_tokens
++                            )
++                            # get_computed_blocks records stats internally, so
++                            # only the per-group path records here.
++                            if self.kv_cache_manager.log_stats:
++                                assert (
++                                    self.kv_cache_manager.prefix_cache_stats
++                                    is not None
++                                )
++                                self.kv_cache_manager.prefix_cache_stats.record(
++                                    num_tokens=request.num_tokens,
++                                    num_hits=num_new_local_computed_tokens,
++                                    preempted=request.num_preemptions > 0,
++                                )
+                     else:
+                         (
+                             new_computed_blocks,
+@@ -808,6 +847,17 @@ class Scheduler(SchedulerInterface):
+ 
+                         num_external_computed_tokens = ext_tokens
+ 
++                        if hit_diverged and num_external_computed_tokens == 0:
++                            # No external tokens back the deeper local hit, so
++                            # its resume boundary would have no valid Mamba
++                            # state. Reconcile to the boundary every group
++                            # agrees on (vLLM #48425 / #46453 port).
++                            (
++                                new_computed_blocks,
++                                num_new_local_computed_tokens,
++                                request.shared_prefix_boundary,
++                            ) = self.kv_cache_manager.get_computed_blocks(request)
++
+                         connector_prefix_cache_queries = (
+                             request.num_tokens - num_new_local_computed_tokens
+                         )
+-- 
+2.43.0
+

@@ -1,0 +1,197 @@
+# qwen38-spark-pair
+
+**A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on 2× NVIDIA DGX Spark (GB10) at TP2**, with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, 2-rail RoCE striping, prefix caching, and an LMCache L1+NVMe KV tier.
+
+Measured on the reference pair: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,400 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+
+This document is written to be executed by an LLM agent with SSH access to both Sparks. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
+
+> Not affiliated with the sparkring project, but its NCCL patches and container pinning are used as upstream ingredients. Nothing here modifies any upstream repo.
+
+---
+
+## What you need
+
+- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS with **driver 580.x** (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see Phase 5 backend pins), Docker with NVIDIA runtime.
+- 2–4 direct 200G QSFP cables between the pair's ConnectX-7 ports (2 minimum, one per card; 4 harmless, only 2 are used).
+- ~80 GB free disk per node (model + build trees + cache tier headroom; NVMe cache cap is configurable).
+- A LAN IP for each node and SSH between them.
+
+## Site values
+
+Substitute these everywhere (files listed are in `scripts/`):
+
+| Value (reference pair) | Meaning | Appears in |
+|---|---|---|
+| `192.168.0.200` / `192.168.0.174` | rank0 / rank1 **LAN** IPs | `run-serve-tp2-v2.sh` (lmcache server_urls) |
+| `198.18.200.1` / `198.18.200.2` | rank0 / rank1 **fabric** IPs (any /30 or /24 on one direct cable) | `run-serve-tp2-v2.sh`, `tp2-ray-head.sh`, `tp2-ray-worker.sh` |
+| `10.42.{1..4}.0/24`, host `.1`/`.2` | per-cable rail subnets (rank0=.1, rank1=.2) | `boot-stack-aa42.sh`, `boot-worker-931e.sh` |
+| `enp1s0f0np0`, `enp1s0f1np1`, `enP2p1s0f0np0`, `enP2p1s0f1np1` | the four CX7 netdev names (check `ip -br link`) | boot scripts, `tp2-env.sh` |
+| `rocep1s0f0`, `roceP2p1s0f0` | RDMA device names of **one port on each card** (check `ibv_devices`; pairing ports of the same card is pointless — they share one PCIe x4 ≈ 110 Gb/s) | `tp2-env.sh` STRIPE=2 block |
+| `ggrun` (rank0) / `ggbuild` (rank1) | serving container names | boot scripts, all launch commands |
+| `/home/code/work/qwen38-exl3` | host work dir, bind-mounted as `/ws` | everywhere |
+
+Convention below: **[r0]** = run on rank0 host, **[r1]** = rank1, **[both]** = both. Container commands are `docker exec <container> bash -c "..."` with the work dir at `/ws`.
+
+---
+
+## Phase 1 — Fabric bring-up
+
+1. [both] Confirm the direct links are up: `ip -br link | grep -E "en[pP]"` — the cabled ports show `UP`.
+2. [both] Give one cable a point-to-point subnet for bootstrap (the "fabric IP" above), e.g. rank0 `sudo ip addr add 198.18.200.1/30 dev enp1s0f0np0`, rank1 `.2/30` on its cabled peer port. (If your OS manages these already, use what exists.)
+3. [both] Add the per-cable rail /24s (used by NCCL striping). No sudo needed later if you use a NET_ADMIN helper container (Phase 2); with sudo now:
+   `ip addr add 10.42.N.{1|2}/24 dev <Nth-cable-netdev>` for each cable N.
+4. Qualify each cable: `ib_write_bw` between the pair per RDMA device. Expect **~109 Gb/s** per link (PCIe Gen5 x4 ceiling per card — this is normal on Spark, not a cabling fault).
+
+**Verify:** ping across the fabric IP; `ib_write_bw` ≥ ~100 Gb/s on both cards' chosen ports.
+
+## Phase 2 — Containers
+
+1. [both] Serving/build container from the CUDA base image (sparkring-pinned digest works; any recent `nvcr.io/nvidia/cuda:13.x-devel-ubuntu24.04` aarch64 image should too):
+
+```
+docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
+  --gpus all --network host --ipc host --cap-add IPC_LOCK \
+  --device /dev/infiniband \
+  -v /home/<user>/work/qwen38-exl3:/ws \
+  nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04 sleep infinity
+```
+
+2. [both] In-container deps: `apt-get update && apt-get install -y python3 python3-dev python3-venv git cmake ninja-build ccache && apt-get install -y cuda-toolkit-13-2` — **the CUDA 13.2 toolkit is required** (13.0 base cannot build the fork's kernels).
+3. [both, optional] NET_ADMIN helper for sudo-less rail IPs at boot: `docker run -d --name netadm --restart unless-stopped --network host --cap-add NET_ADMIN ubuntu:24.04 sleep infinity`.
+
+**Verify:** `docker exec <c> nvcc --version` reports 13.2; `docker exec <c> ls /dev/infiniband` shows uverbs devices.
+
+## Phase 3 — Python env + kernel libraries
+
+All builds happen in the rank0 container; rank1 receives the finished tree (Phase 7).
+
+1. venv at `/ws/venv`; install torch aarch64 cu132: `pip install torch==2.12.0 torchvision --index-url <cu132 wheel index>` and `pip install b12x==1.2.4 ray==2.57.0 setuptools-rust ninja`.
+2. **exllamav3 (needs the ARM port — upstream is x86-only):**
+
+```
+cd /ws/src && git clone https://github.com/turboderp-org/exllamav3 && cd exllamav3
+git checkout 5f3c537
+git apply /ws/patches/exllamav3-arm.patch
+TORCH_CUDA_ARCH_LIST="12.1" python setup.py bdist_wheel   # plain 12.1 here — NOT 12.0f
+pip install dist/*.whl --no-deps
+```
+
+**Verify:** `python -c "from exllamav3_ext import exl3_gemm; print('ok')"`.
+
+## Phase 4 — The vLLM fork
+
+```
+cd /ws/src && git clone https://github.com/local-inference-lab/vllm vllm-gg && cd vllm-gg
+git checkout fa033bd4e                     # dev/gilded-gnosis pin
+git fetch origin pull/318/head:pr318 && git merge pr318   # perf stack (⊇ #316 ⊇ #314); merges clean
+git am /ws/patches/fork-ports.patch        # our two ports: vLLM #51113 + #48425 (see below)
+TORCH_CUDA_ARCH_LIST="12.0f" pip install -e . --no-build-isolation   # 12.0f REQUIRED (see troubleshooting)
+```
+
+The two ports in `fork-ports.patch` are **not optional**:
+- **#51113 port** — mamba-align chunk splitting in the scheduler. Without it, enabling prefix caching on this GDN-hybrid model risks silent corruption.
+- **#48425 port** — per-group prefix-hit divergence reconcile. Without it, LMCache + KV-pressure eviction can resume generation on stale mamba state (silent token salad; see [LMCache issue #4247](https://github.com/LMCache/LMCache/issues/4247)).
+
+**Verify:** `python -c "import vllm; print(vllm.__version__)"`; `cd /ws/src/vllm-gg && python -m pytest tests/v1/core/test_scheduler.py -q` → expect 129/130 (one known order-dependent flake).
+
+## Phase 5 — Model + template
+
+1. Download `malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated` (21.61 GB) to `/ws/model/`, verify SHA256s against the repo's manifest — 16/16 must match.
+2. Copy `scripts/chat_template_agentic.jinja` to `/ws/` (side file — the checkpoint stays byte-untouched). It maps `reasoning_effort` and renders mid-conversation system messages as `<system-reminder>` blocks (agent-CLI friendly).
+
+## Phase 6 — Patched NCCL (2-rail striping)
+
+Build NCCL 2.30.7 with the sparkring switchless-ring patches — the [sparkring repo](https://github.com/FujitsuPolycom/sparkring)'s `runtime/Containerfile` has a self-contained `nccl-build` stage; run that stage and copy `libnccl.so.2.30.7` out to `/ws/nccl-patched/` [both]. Record its sha256.
+
+The injection and all striping env live in `scripts/tp2-env.sh` (`STRIPE=2` block). The non-obvious parts, already encoded there:
+- `NCCL_IB_SUBNET_AWARE_ROUTING=0` — **required**; the subnet-aware feature collapses parallel rails between the same rank pair onto one card.
+- One port per card (`NCCL_IB_HCA=<card1-port0>,<card2-port0>`), `MIN/MAX_NCHANNELS=2` — more rails/channels only add SM contention inside decode CUDA graphs (measured −28% single-stream at 4 rails).
+- Injected via `LD_PRELOAD` + `VLLM_NCCL_SO_PATH`; no system libraries touched.
+
+**Verify (only on an otherwise-idle GPU — NCCL microbenchmarks beside a live engine give phantom milliseconds on GB10):** a 2-rank all-reduce probe shows small-op latency in the tens of µs and ~160 Gb/s at large sizes.
+
+## Phase 7 — Replicate to rank1
+
+Copy `/ws/{venv,src,model,nccl-patched,patches}` and all `scripts/*` to rank1's work dir (rsync over the fabric IP is fastest). The venv is path-portable if the work dir path is identical on both nodes — keep it identical. SHA-verify the model copy.
+
+**Verify [r1]:** the exllamav3 and vllm import checks from Phases 3–4 pass in rank1's container.
+
+## Phase 8 — LMCache tier
+
+1. [both] Build lmcache 0.5.2 from source in the venv: `TORCH_CUDA_ARCH_LIST="12.1" pip install lmcache==0.5.2 --no-build-isolation --no-deps` (**12.1, not 12.0f** — lmcache's arch parser rejects family suffixes).
+2. [both] **Apply the heartbeat fix — mandatory:**
+
+```
+cd /ws/venv/lib/python3.12/site-packages && patch -p1 < /ws/patches/lmcache-0.5.2-heartbeat-fix.patch
+```
+
+Stock 0.5.2's scheduler-side heartbeat never starts (a `{} is not None` dead guard); the servers reap the engine ~2.5 min after start and **every cache lookup silently returns 0 forever** while stores keep working. Benchmarks pass (they query right after restart); production silently loses the tier.
+
+3. [both] NVMe cache dir `mkdir -p /ws/lmcache-l2`.
+4. Server config is `scripts/lmcache-server.sh` — one server per rank, port 6556. Sizing rules baked in, don't lower them casually:
+   - `--chunk-size 1600` — must equal this model's mamba block (1600); chunks are ~106 MB each per rank.
+   - `--l1-size-gb 4` — lookups only count a hit after staging chunks into L1, so **L1 must be ≥ your largest replayed prefix** or lookups silently answer 0.
+   - `fs_native` L2, `use_odirect:false`, capacity to taste (`max_capacity_gb`).
+
+## Phase 9 — Launch
+
+Order matters: cache servers → ray head → ray worker → engine.
+
+```
+[r0] docker exec -d ggrun   bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
+[r1] docker exec -d ggbuild bash -c "RANK=1 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r1.log 2>&1"
+[r0] docker exec ggrun   bash /ws/tp2-ray-head.sh
+[r1] docker exec ggbuild bash /ws/tp2-ray-worker.sh
+[r0] docker exec -d ggrun bash -c "LMC=1 APC=1 STRIPE=2 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 bash /ws/run-serve-tp2-v2.sh > /ws/logs/serve.log 2>&1"
+```
+
+The serve script's gates (each is one env var + restart to A/B):
+
+| Gate | Production | Meaning |
+|---|---|---|
+| `LMC` | 1 | LMCache connector on. **Forces `BATCHTOK ∈ [1600,3200)`** — the mamba-align guard; 3072 is the best legal value (~8% cold-prefill cost, invisible under concurrent load). `LMC=0` → use `BATCHTOK=8192` |
+| `APC` | 1 | prefix caching + `--mamba-cache-mode align` (safe only because of the #51113 port) |
+| `STRIPE` | 2 | 2-rail patched-NCCL transport (0 = stock single-cable) |
+| `MTPK` | 2 | MTP speculative depth (2 = throughput mode; 3 = +6% single-stream, −4% @cc64) |
+| `KVDTYPE` | fp8 | FP8 KV cache — doubles the KV pool (~1.78M tokens at gpu-mem 0.40) |
+| `STAGE` | graph | EXL3 CUDA-graph decode (+25% vs eager) |
+
+Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn-backend TORCH_SDPA`, and `"attention_backend":"TRITON_ATTN"` **inside** the speculative config — all three pins exist because driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX; the drafter crashes without its own pin. `VLLM_EXL3_PREFILL_FP8=1` (2.16× prefill) and `VLLM_EXL3_PREFILL_RECONSTRUCT_M=256` (the default 128 collides with MTP-inflated decode batches at cc32) are exported by the script.
+
+Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the env gates in the serve line to match production first).
+
+## Phase 10 — Validation gauntlet
+
+1. **Liveness:** `curl http://<rank0-lan>:8000/v1/models`.
+2. **Exactness:** a few greedy (`temperature 0`) probes — arithmetic, instruction-following. Re-run each twice: byte-identical.
+3. **Heartbeat (the fix from Phase 8 working):** engine log contains `Started PeriodicThread: lmcache-heartbeat`; server logs show **no** `Reaped GPU instance` while the engine lives.
+4. **APC:** send a ~9K-token prompt twice: second is ~2× faster, byte-identical output.
+5. **Cache tier end-to-end:** send a ~20K-token greedy prompt (cold, time it) → restart the engine (`pkill -f "vllm [s]erve"`, relaunch) → same prompt: expect **~7× faster**, byte-identical, server logs showing `Prefetch request completed ... retained keys` and `Retrieved N tokens`. For the full test also restart the *servers* first — hits then come from NVMe (`0 L1, N L2`).
+6. **Wait 4+ minutes, replay again** — this specifically catches the heartbeat bug's signature (works-then-silently-stops). Expect hits, not a slow recompute.
+7. **Perf reference (yours should be in the same ballpark):** cc1 ≈ 27 tok/s · cc64 ≈ 275 aggregate · cold prefill ≈ 1,375 tok/s @ BATCHTOK 3072.
+
+## Troubleshooting (the mistakes already made for you)
+
+| Symptom | Cause / fix |
+|---|---|
+| ptxas: `cvt with .e2m1x2 not supported on sm_120` building the fork | `TORCH_CUDA_ARCH_LIST=12.1` silently clamps to plain 12.0 under CUDA≥13. Use `"12.0f"` (family target) for the fork. exllamav3 and lmcache want plain `12.1`. |
+| `cudaErrorUnsupportedPtxVersion` at startup or first MTP step | FA2 PTX vs driver 580. Pin TRITON_ATTN / TORCH_SDPA / drafter backend (already in the serve script). |
+| Engine refuses graph decode | Needs `VLLM_EXL3_GRAPH_DECODE=1` **and** `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` (script sets both under `STAGE=graph`). |
+| `block_size <= max_num_batched_tokens < 2*block_size` error with LMC=1 | The mamba-align guard (block=1600). Set `BATCHTOK=3072`. Do **not** delete the guard — it prevents real KV corruption. |
+| "LMCache chunk size should be a multiple of vLLM block size" | Chunk must be 1600 for this model (server script already is). |
+| Cache stores work but replays never speed up | The heartbeat bug — you skipped Phase 8 step 2. Confirm with validation steps 3 and 6. |
+| Large replays return 0 hits though chunks exist on NVMe | L1 too small to stage the prefix (silent). Raise `--l1-size-gb` (~106 MB × chunks-per-prefix per rank). |
+| Striping shows 1 rail busy, others idle | `NCCL_IB_SUBNET_AWARE_ROUTING` still on, or rail /24s missing. |
+| −25–30% single-stream after enabling striping | Too many rails/channels (SM contention in decode graphs). 2 rails, 2 channels, one port per card. |
+| Throughput drops ~20% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
+| NCCL probe shows ~2.3 ms latency floor | You benchmarked beside the live engine — GB10 context timeslicing phantom. Quiesce first. |
+| Garbage/multilingual output on shared-prefix requests under memory pressure | You skipped the #48425 port in `fork-ports.patch`. |
+
+## Known limitations
+
+Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Long-context (100K+) concurrency untested. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
+
+## Credits
+
+turboderp (exllamav3) · the Gilded Gnosis fork authors · malaiwah (the checkpoint and its exemplary model card, plus the #4247 root-causing) · hasso5703 (chat template lineage) · MikeWang0316tw (LMCache #4247 investigation) · the sparkring project (NCCL patches, container pinning, cable-qual discipline) · the vLLM and LMCache maintainers.
