@@ -12,7 +12,7 @@ This document is written to be executed by an LLM agent with SSH access to both 
 
 ## What you need
 
-- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS with **driver 580.x** (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see Phase 5 backend pins), Docker with NVIDIA runtime.
+- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS (Ubuntu 24.04.4 LTS as tested) with **driver 580.173.02** (any 580.x should behave identically) (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see Phase 5 backend pins), Docker with NVIDIA runtime.
 - 2–4 direct 200G QSFP cables between the pair's ConnectX-7 ports (2 minimum, one per card; 4 harmless, only 2 are used).
 - ~80 GB free disk per node (model + build trees + cache tier headroom; NVMe cache cap is configurable).
 - A LAN IP for each node and SSH between them.
@@ -82,10 +82,11 @@ docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
   --gpus all --network host --ipc host --cap-add IPC_LOCK \
   --device /dev/infiniband \
   -v /home/<user>/work/qwen38-exl3:/ws \
-  nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04 sleep infinity
+  nvcr.io/nvidia/cuda@sha256:5c36750138dc1447a17dafbb397674f167d3b44ce18d9160d769df114577b35d sleep infinity
+  # (= the 13.0.1-devel-ubuntu24.04 tag at test time, pinned by digest)
 ```
 
-2. [both] In-container deps: `apt-get update && apt-get install -y python3 python3-dev python3-venv git cmake ninja-build ccache && apt-get install -y cuda-toolkit-13-2` — **the CUDA 13.2 toolkit is required** (13.0 base cannot build the fork's kernels).
+2. [both] In-container deps: `apt-get update && apt-get install -y python3 python3-dev python3-venv git cmake ninja-build ccache && apt-get install -y cuda-toolkit-13-2` — **the CUDA 13.2 toolkit is required** (13.0 base cannot build the fork's kernels; 13.2.86 as tested — the meta-package floats within 13.2.x).
 3. [both] **Prevent the container from losing its GPU.** With cgroups v2 and the systemd driver,
    containers can lose access to the NVIDIA devices (`Failed to initialize NVML: Unknown Error`,
    surfacing later as `CUDA error: invalid device ordinal`), often triggered by
@@ -107,7 +108,16 @@ sudo nvidia-ctk system create-dev-char-symlinks --create-all
 
 All builds happen in the rank0 container; rank1 receives the finished tree (Phase 7).
 
-1. venv at `/ws/venv`; install torch aarch64 cu132: `pip install torch==2.12.0 torchvision --index-url <cu132 wheel index>` and `pip install b12x==1.2.4 ray==2.57.0 setuptools-rust ninja`.
+1. venv at `/ws/venv`, then:
+
+```
+pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu132
+pip install b12x==1.2.4 ray==2.57.0 setuptools-rust ninja pytest
+```
+
+   (`pytest` is needed by the Phase 4 verify gate.) The full 231-package closure of the tested
+   venv is committed as [`requirements-freeze.txt`](requirements-freeze.txt) — if a build fails on
+   a transitive dependency, diff your venv against it before debugging anything else.
 2. **exllamav3 (needs the ARM port — upstream is x86-only):**
 
 ```
@@ -121,6 +131,22 @@ pip install dist/*.whl --no-deps
 **Verify:** `python -c "from exllamav3_ext import exl3_gemm; print('ok')"`.
 
 ## Phase 4 — The vLLM fork
+
+Two equivalent paths — **A** is the immutable one, **B** shows the provenance.
+
+**A — pinned mirror (recommended).** The exact tested tree (base `fa033bd4e` + the PR-318 merge +
+both ports, tip `229effc810ee`) is preserved at
+[FujitsuPolycom/vllm](https://github.com/FujitsuPolycom/vllm/tree/gg-perf-mtp), tag
+`qwen38-tested-20260817`, so it does not depend on the upstream PR staying open or unchanged:
+
+```
+cd /ws/src && git clone --branch qwen38-tested-20260817 https://github.com/FujitsuPolycom/vllm vllm-gg && cd vllm-gg
+TORCH_CUDA_ARCH_LIST="12.0f" pip install -e . --no-build-isolation   # 12.0f REQUIRED (see troubleshooting)
+```
+
+`fork-ports.patch` is **already in this tree** — do not apply it again.
+
+**B — from parts** (fails if upstream force-pushes or deletes PR 318 — which is why A exists):
 
 ```
 cd /ws/src && git clone https://github.com/local-inference-lab/vllm vllm-gg && cd vllm-gg
@@ -149,12 +175,26 @@ moved before debugging anything else.
 
 ## Phase 5 — Model + template
 
-1. Download `malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated` (21.61 GB) to `/ws/model/`, verify SHA256s against the repo's manifest — 16/16 must match.
+1. Download the checkpoint **at the tested revision** (21.61 GiB — the bare repo ID is mutable;
+   its model card changed during this campaign, weights unchanged):
+
+```
+huggingface-cli download malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated \n  --revision ab3a91a13813df8096cb4c1d560ed3669035d0cf --local-dir /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated
+```
+
+   Verify SHA256s against the repo's manifest — 16/16 must match. The weight shards at this
+   revision are byte-identical to the tested deployment (spot-verified via LFS OIDs).
 2. Copy `scripts/chat_template_agentic.jinja` to `/ws/` (side file — the checkpoint stays byte-untouched). It maps `reasoning_effort` and renders mid-conversation system messages as `<system-reminder>` blocks (agent-CLI friendly).
 
 ## Phase 6 — Patched NCCL (2-rail striping)
 
-Build NCCL 2.30.7 with the sparkring switchless-ring patches — the [sparkring repo](https://github.com/FujitsuPolycom/sparkring)'s `runtime/Containerfile` has a self-contained `nccl-build` stage; run that stage and copy `libnccl.so.2.30.7` out to `/ws/nccl-patched/` [both]. Record its sha256.
+Build NCCL 2.30.7 with the sparkring switchless-ring patches — the [sparkring repo](https://github.com/FujitsuPolycom/sparkring)'s `runtime/Containerfile` (commit `4545c4ec4740` as tested) has a self-contained `nccl-build` stage; run that stage and copy `libnccl.so.2.30.7` out to `/ws/nccl-patched/` [both], then create the SONAME links the scripts load:
+
+```
+cd /ws/nccl-patched && ln -sf libnccl.so.2.30.7 libnccl.so.2 && ln -sf libnccl.so.2 libnccl.so
+```
+
+Verify: `sha256sum libnccl.so.2.30.7` → `e69a8c240f45d10166bcd901d99db78bb63147adda66e586d8dd505c6d608b54` on the tested pair.
 
 The injection and all striping env live in `scripts/tp2-env.sh` (`STRIPE=2` block). The non-obvious parts, already encoded there:
 - `NCCL_IB_SUBNET_AWARE_ROUTING=0` — **required**; the subnet-aware feature collapses parallel rails between the same rank pair onto one card.

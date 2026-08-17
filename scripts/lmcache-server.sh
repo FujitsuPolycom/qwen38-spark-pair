@@ -2,7 +2,8 @@
 # Per-rank LMCache MP server (CS512 profile, adapted from the sparkring GLM lane).
 # Usage: RANK=0|1 bash /ws/lmcache-server.sh   (inside the rank's container)
 # Tiering is GB10-aware: tiny lazy L1 (1 GB, lives in unified memory) and the
-# real capacity on NVMe L2 (200 GB, O_DIRECT so the page cache stays out of
+# L1 8 GB (>= longest replayed prefix; chunk = 106 MB/rank at TP2, 213 MB at TP1).
+# L2 fs_native on NVMe, odirect off (either works; see recipe README).
 # unified memory too).
 set -u
 . /ws/venv/bin/activate

@@ -24,7 +24,8 @@ fi
 
 STAGE="${STAGE:-graph}"
 APC="${APC:-0}"
-SPEC="${SPEC:-mtp}"   # mtp = built-in MTP head; dspark = RadixArk 1.36B drafter (see DSPARK-TRIAL.md)
+SPEC="${SPEC:-mtp}"   # mtp = built-in MTP head. (dspark needs a separately prepared
+                      # drafter checkpoint NOT included in this recipe; trial closed negative.)
 MTPK="${MTPK:-3}"
 BATCHTOK="${BATCHTOK:-8192}"
 KVDTYPE="${KVDTYPE:-auto}"
