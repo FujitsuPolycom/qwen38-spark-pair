@@ -34,7 +34,7 @@
     "nccl_library_sha256": "e69a8c240f45d10166bcd901d99db78bb63147adda66e586d8dd505c6d608b54",
     "lmcache": "0.5.2 + heartbeat patch",
     "public_sparkring_repository": "https://github.com/FujitsuPolycom/sparkring",
-    "recipe_repository": "REPLACE_WITH_RECIPE_REPOSITORY_URL",
+    "recipe_repository": "https://github.com/FujitsuPolycom/qwen38-spark-pair",
     "patches_required": [
       "exllamav3 aarch64 port (upstream is x86-only)",
       "vLLM #51113 port: mamba-align chunk splitting into the fork's diverged scheduler; prerequisite for safe prefix caching on this hybrid model",
