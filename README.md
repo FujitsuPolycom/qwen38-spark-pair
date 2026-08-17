@@ -95,7 +95,10 @@ docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
 
 ```bash
 sudo nvidia-ctk system create-dev-char-symlinks --create-all
+sudo tee /etc/cron.d/nvidia-dev-char <<< "@reboot root /usr/bin/nvidia-ctk system create-dev-char-symlinks --create-all"
 ```
+
+   (The symlinks do not persist across reboots — the cron.d entry recreates them at boot.)
 
    `scripts/boot-stack-aa42.sh` (the boot-persistence script installed in Phase 9) also detects the condition and restarts the container, but preventing it
    is better than recovering from it — the recovery costs a restart cycle and only fires at boot.
