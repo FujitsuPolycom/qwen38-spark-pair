@@ -161,6 +161,35 @@ Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn
 
 Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the env gates in the serve line to match production first).
 
+## Running on a single Spark (`TP=1`)
+
+The same stack runs on one node — pass `TP=1` and the launcher drops everything two-node:
+ray, the patched-NCCL striping, and the rank-1 cache server (the connector is pointed at the
+local one only). Phases 1, 6 and 7 become unnecessary; nothing else changes. Every patch still
+applies, including the #48425 guard and the lmcache heartbeat fix, neither of which is about
+node count.
+
+```
+docker exec -d <container> bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
+docker exec -d <container> bash -c "TP=1 LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 bash /ws/run-serve-tp2-v2.sh > /ws/logs/serve.log 2>&1"
+```
+
+Expect roughly, extrapolated from the measured TP2 scaling (verify against your own
+`GPU KV cache size:` line on first boot rather than trusting these):
+
+| | 2× Spark | 1× Spark |
+|---|---:|---:|
+| Decode, single stream | 27 tok/s | ~17 tok/s |
+| Cold prefill | ~1,375 tok/s | ~700 tok/s |
+| Aggregate @ 64 streams | 275 tok/s | ~160 tok/s |
+| GPU KV pool @ `GPUMEM=0.70` | 3.94M tokens | ~1.65M tokens |
+
+The pool roughly halves for two compounding reasons: one node now carries all 21.6 GB of
+weights instead of half, and with no tensor parallelism every KV head lives on the one GPU, so
+per-token cost doubles. Consider lowering `--max-num-seqs` from 64 to match — a third of the
+pool shared by the same 64 streams leaves each one much less room. The NVMe cache tier matters
+more here, not less, since there is a smaller GPU pool for it to back.
+
 ## Phase 10 — Validation gauntlet
 
 1. **Liveness:** `curl http://<rank0-lan>:8000/v1/models`.

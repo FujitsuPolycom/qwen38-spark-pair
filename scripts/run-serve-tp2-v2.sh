@@ -10,10 +10,15 @@
 #                       E4M3 numerics, decode keeps exact trellis kernels
 #   MTPK=3              speculative depth (community favors 2 under concurrency)
 #   BATCHTOK=8192       max-num-batched-tokens (sweep: 3072/4096/8192)
+#   TP=2                1 = single Spark (drops ray, striping, rank-1 cache server;
+#                       expect ~17 tok/s decode, ~700 prefill, ~1.65M KV @ GPUMEM=0.70)
 #   KVDTYPE=auto        fp8 = FP8 KV cache (community: avoids -33% long-depth penalty)
 set -u
 . /ws/venv/bin/activate
-RANK_IP=198.18.200.1 . /ws/tp2-env.sh
+TP="${TP:-2}"          # 1 = single Spark: no ray, no striping, one cache server
+if [ "$TP" -gt 1 ]; then
+  RANK_IP=198.18.200.1 . /ws/tp2-env.sh
+fi
 
 STAGE="${STAGE:-graph}"
 APC="${APC:-0}"
@@ -35,9 +40,15 @@ if [ "$APC" = "1" ]; then EXTRA+=(--enable-prefix-caching --mamba-cache-mode ali
 if [ "${LMC:-0}" = "1" ]; then
   export LMCACHE_DISABLE_BANNER=1
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-  EXTRA+=(--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.server_urls":["tcp://192.168.0.200:6556","tcp://192.168.0.174:6556"],"lmcache.mp.mq_timeout":60,"lmcache.mp.heartbeat_interval":10}}')
+  if [ "$TP" -gt 1 ]; then
+    SERVER_URLS='["tcp://192.168.0.200:6556","tcp://192.168.0.174:6556"]'
+  else
+    SERVER_URLS='["tcp://192.168.0.200:6556"]'
+  fi
+  EXTRA+=(--kv-transfer-config "{\"kv_connector\":\"LMCacheMPConnector\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"lmcache.mp.server_urls\":$SERVER_URLS,\"lmcache.mp.mq_timeout\":60,\"lmcache.mp.heartbeat_interval\":10}}")
 fi
 if [ "$KVDTYPE" != "auto" ]; then EXTRA+=(--kv-cache-dtype "$KVDTYPE"); fi
+if [ "$TP" -gt 1 ]; then EXTRA+=(--distributed-executor-backend ray); fi
 
 exec vllm serve /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated \
   --served-model-name qwen38 --quantization exl3 "${EXTRA[@]}" \
@@ -48,6 +59,6 @@ exec vllm serve /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated \
     else
       echo "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTPK,\"attention_backend\":\"TRITON_ATTN\"}"
     fi )" \
-  --max-model-len 262144 --max-num-batched-tokens "$BATCHTOK" --gpu-memory-utilization 0.40 --max-num-seqs 64 \
-  --tensor-parallel-size 2 --distributed-executor-backend ray \
+  --max-model-len 262144 --max-num-batched-tokens "$BATCHTOK" --gpu-memory-utilization ${GPUMEM:-0.70} --max-num-seqs 64 \
+  --tensor-parallel-size "$TP" \
   --host 0.0.0.0 --port 8000
