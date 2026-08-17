@@ -222,36 +222,102 @@ Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the en
 
 ## One Spark or two
 
-Everything in this recipe runs on **either a single Spark or a pair** — `TP` is the switch, and
-it is the only thing you change. `TP=2` (default) uses ray, two-rail RoCE striping and a cache
-server per rank; `TP=1` drops all three, and the launcher skips those gates rather than failing
-them.
+`TP` is the switch and the only thing you change. `TP=2` uses ray, two-rail RoCE striping and a
+cache server per rank; `TP=1` drops all three and the launcher skips those gates.
+
+```bash
+# two Sparks
+bash scripts/start-stack.sh
+
+# one Spark
+TP=1 bash scripts/start-stack.sh
+```
+
+Full production launch, either way:
+
+```bash
+TP=2 LMC=1 APC=1 STRIPE=2 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
+
+TP=1 LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
+```
+
+On a single node, **phases 1, 6 and 7 are unnecessary** — no fabric to qualify, no patched NCCL
+to build, nothing to replicate. All four patches still apply: they concern hybrid KV groups and
+cache liveness, not node count.
+
+### Measured
+
+Both configurations, same harness, greedy, `GPUMEM=0.70`, `BATCHTOK=3072`, LMCache on.
+
+**Two Sparks** — KV pool 3,935,138 tokens
+
+| | cc1 | cc2 | cc4 |
+|---|---:|---:|---:|
+| decode @ 4k ctx | 30.9 | 55.7 | 101.7 |
+| decode @ 16k ctx | 32.2 | 57.8 | 105.6 |
+
+Prefill: 1,085 / 1,064 / 1,004 / 918 tok/s at 4k / 8k / 16k / 32k.
+Longer runs: 27.0 tok/s single-stream at 256-token generations, 275 tok/s aggregate at 64
+streams, ~1,375 tok/s cold prefill on an 11.5K prompt.
+
+**One Spark** — KV pool 1,669,678 tokens
+
+| | cc1 | cc2 | cc4 |
+|---|---:|---:|---:|
+| decode @ 4k ctx | 23.8 | 43.1 | 85.2 |
+| decode @ 16k ctx | 22.2 | 42.0 | 85.3 |
+
+Prefill: 330 / 398 / 446 / 667 tok/s at 4k / 8k / 16k / 32k. Prefill throughput *rises* with
+context here — fixed per-request overhead dominates at these sizes and amortizes as prompts grow.
+
+MTP acceptance runs 2.5–2.65 tokens per step in both configurations.
+
+Recommended single-node adjustments: lower `--max-num-seqs` from 64 (the KV pool is smaller, so
+64 streams each get a much thinner slice), and see LMCache sizing below — the chunk size doubles.
+
+## LMCache sizing
+
+Chunk size is fixed by the model, not by choice: it must be a multiple of the 1600-token mamba
+block, so this deployment uses **1600**. What that costs in bytes depends on tensor parallelism,
+because each rank stores only its share of the KV heads:
 
 ```
-bash scripts/start-stack.sh            # 2x Spark (default)
-TP=1 bash scripts/start-stack.sh       # 1x Spark
+chunk bytes per rank = 65 layers x 2 (K,V) x 1600 tokens x 512 B / TP
 ```
 
-On a single node, **phases 1, 6 and 7 below are unnecessary** — no fabric to qualify, no patched
-NCCL to build, nothing to replicate. Everything else is identical, including all four patches:
-the #48425 guard and the lmcache heartbeat fix are about hybrid KV groups and cache liveness,
-not node count.
-
-| | 2x Spark | 1x Spark |
+| | bytes per chunk, per rank | replayable tokens per GB of L1 |
 |---|---:|---:|
-| Decode, single stream | 27–28.6 tok/s | ~17 tok/s |
-| Cold prefill | ~1,375 tok/s | ~700 tok/s |
-| Aggregate @ 64 streams | 275 tok/s | ~160 tok/s |
-| GPU KV pool @ `GPUMEM=0.70` | ~3.9M tokens | ~1.65M tokens |
-| Needs ray / striping / 2nd cache server | yes | no |
+| TP=2 | 106,496,000 (≈106 MB) | ≈15,000 |
+| TP=1 | 212,992,000 (≈213 MB) | ≈7,500 |
 
-The pool roughly halves for two compounding reasons: one node carries all 21.6 GB of weights
-instead of half, and with no tensor parallelism every KV head lives on the one GPU, so per-token
-cost doubles. Consider lowering `--max-num-seqs` to match. The NVMe cache tier matters *more*
-on a single node, not less, since there is a smaller GPU pool behind it.
+**L1 is a hard ceiling on replay length.** A lookup only counts an L2 hit *after* staging the
+chunks into L1, so a prefix longer than L1 can hold returns **zero hits — silently** — even when
+every chunk is sitting on NVMe. This is the single most confusing failure in the whole stack:
+the cache looks healthy, stores work, and replays quietly recompute.
 
-The 1x figures are extrapolated from the measured TP2 scaling, not directly benchmarked —
-verify against your own `GPU KV cache size:` line on first boot.
+| `--l1-size-gb` | TP=2 replay ceiling | TP=1 replay ceiling |
+|---:|---:|---:|
+| 4 | ≈59K tokens | ≈29K tokens |
+| **8** (default here) | **≈118K tokens** | **≈59K tokens** |
+| 16 | ≈236K tokens | ≈118K tokens |
+| 17.5 / 35 | full 262K context | full 262K context |
+
+Pick it from the longest prompt you actually expect to replay, then check it fits: L1 lives in
+the same unified memory as the engine, so `GPUMEM x 121 GB + L1 + OS` must leave headroom. At
+`GPUMEM=0.70` the engine takes ~85 GB, leaving roughly 19 GB — 8 GB of L1 is comfortable there,
+16 GB is not.
+
+**L2 (NVMe)** is cheap by comparison and bounded by `max_capacity_gb` (200 GB here ≈ 3.0M tokens
+at TP=2). It is content-addressed and survives both engine and cache-server restarts, so it is
+the tier that makes cold-start replays fast. It costs nothing but disk — size it generously.
+
+Two operational rules that follow from the above:
+
+- **Restart order is kill engine → cycle cache servers → start engine.** The servers hold the
+  engine's KV cache through CUDA IPC and never release it on engine exit; skipping the cycle
+  leaves too little memory for the next start.
+- **Chunk size must stay a multiple of the mamba block**, and `max_num_batched_tokens` must stay
+  in `[1600, 3200)` while LMCache is attached.
 
 ## Phase 10 — Validation gauntlet
 

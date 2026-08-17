@@ -203,7 +203,7 @@ info "log: $LOG"
 # reports a failed `>` before any `2>/dev/null` on the same line can suppress
 # it. The container's own redirect below truncates it as root regardless.
 docker exec -d "$C0" bash -c \
-    "LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM bash /ws/run-serve-tp2-v2.sh > ${LOG/$WS//ws} 2>&1"
+    "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM bash /ws/run-serve-tp2-v2.sh > ${LOG/$WS//ws} 2>&1"
 
 # ---- verify ----------------------------------------------------------------
 step "Waiting for the engine to answer (timeout ${ENGINE_TIMEOUT}s)"
