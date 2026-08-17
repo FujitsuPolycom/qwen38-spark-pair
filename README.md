@@ -6,7 +6,7 @@ Measured on one such pair — the "reference pair" referenced throughout: **27 t
 
 This document is written to be executed by an LLM agent with SSH access to both Sparks. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
-> Not affiliated with the sparkring project (source of the switchless-ring NCCL patches built in Phase 6 and the container pin in Phase 2), but its NCCL patches and container pinning are used as upstream ingredients. Nothing here modifies any upstream repo.
+> The [sparkring](https://github.com/FujitsuPolycom/sparkring) project (same maintainer) supplies two ingredients: the switchless-ring NCCL patches built in Phase 6 and the container image pin in Phase 2. This repository consumes them at pinned revisions and modifies neither sparkring nor any other upstream.
 
 ---
 
