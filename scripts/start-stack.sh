@@ -24,10 +24,14 @@ C1="${C1:-ggbuild}"                           # rank 1 serving container
 WS="${WS:-/home/code/work/qwen38-exl3}"       # host work dir (= /ws in container)
 API="${API:-http://127.0.0.1:8000}"
 LMCACHE_PORT="${LMCACHE_PORT:-6556}"
-TP_SIZE="${TP_SIZE:-2}"
+TP="${TP:-2}"                                 # 1 = single Spark, 2 = the pair
+TP_SIZE="$TP"
+MULTI=$([ "$TP" -gt 1 ] && echo 1 || echo 0)  # 1 = rank-1 / transport checks apply
 
 # ---- serve gates (passed through to run-serve-tp2-v2.sh) -------------------
-LMC="${LMC:-1}"; APC="${APC:-1}"; STRIPE="${STRIPE:-2}"; MTPK="${MTPK:-2}"
+LMC="${LMC:-1}"; APC="${APC:-1}"; MTPK="${MTPK:-2}"
+# Striping is a two-node concept: with TP=1 there are no collectives to stripe.
+if [ "$MULTI" = "1" ]; then STRIPE="${STRIPE:-2}"; else STRIPE=0; fi
 KVDTYPE="${KVDTYPE:-fp8}"; STAGE="${STAGE:-graph}"; BATCHTOK="${BATCHTOK:-3072}"
 GPUMEM="${GPUMEM:-0.70}"
 LOG="${LOG:-$WS/logs/serve-lmc.log}"
@@ -75,7 +79,11 @@ else
 fi
 ENGINE_ALREADY_UP="${ENGINE_ALREADY_UP:-0}"
 
-# --- gate 2: ray cluster is whole AND its GPUs are free ---------------------
+# --- gate 2: ray cluster is whole AND its GPUs are free (multi-node only) ---
+# TP=1 runs in-process with no ray executor, so there is no cluster to check.
+if [ "$MULTI" = "0" ]; then
+    pass "single node (TP=1): ray, striping and rank-1 checks skipped"
+else
 # THIS is the gate that matters most. Killing an engine does not instantly
 # release its ray actors; launching into a half-released cluster makes vLLM
 # see 1 GPU, fail the TP2 placement group, and emit a traceback whose real
@@ -107,14 +115,19 @@ done
 nodes=$(docker exec "$C0" bash -c '. /ws/venv/bin/activate 2>/dev/null && ray status 2>/dev/null' | grep -c '^ 1 node_')
 [ "$nodes" -ge "$TP_SIZE" ] || die 11 "ray sees $nodes node(s), need $TP_SIZE — rank 1 has not joined"
 pass "ray: $nodes nodes joined"
+fi
 
 # --- gate 3: cache servers listening on both ranks --------------------------
 if [ "$LMC" = "1" ]; then
     ss -tln 2>/dev/null | grep -q ":$LMCACHE_PORT " \
         || die 12 "no LMCache server on rank 0 port $LMCACHE_PORT — start it first: docker exec -d $C0 bash -c 'RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1'"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$RANK1_HOST" "ss -tln | grep -q ':$LMCACHE_PORT '" \
-        || die 12 "no LMCache server on rank 1 ($RANK1_HOST) port $LMCACHE_PORT"
-    pass "LMCache servers listening on both ranks"
+    if [ "$MULTI" = "1" ]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$RANK1_HOST" "ss -tln | grep -q ':$LMCACHE_PORT '" \
+            || die 12 "no LMCache server on rank 1 ($RANK1_HOST) port $LMCACHE_PORT"
+        pass "LMCache servers listening on both ranks"
+    else
+        pass "LMCache server listening (single node)"
+    fi
 
     # The heartbeat fix is mandatory: without it the servers reap the engine
     # ~2.5 min in and every lookup silently returns 0 while stores keep working.
@@ -131,10 +144,14 @@ fi
 # --- gate 4: model present on both ranks ------------------------------------
 docker exec "$C0" bash -c 'ls /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated/*.safetensors >/dev/null 2>&1' \
     || die 13 "model weights missing on rank 0"
+if [ "$MULTI" = "1" ]; then
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$RANK1_HOST" \
     "ls $WS/model/Qwen3.8-27B-EXL3-K5K6-hydrated/*.safetensors >/dev/null 2>&1" \
     || die 13 "model weights missing on rank 1 — TP2 needs the checkpoint on both nodes"
-pass "model weights present on both ranks"
+    pass "model weights present on both ranks"
+else
+    pass "model weights present"
+fi
 
 # --- gate 5: patched NCCL present if striping -------------------------------
 if [ "${STRIPE:-0}" != "0" ]; then

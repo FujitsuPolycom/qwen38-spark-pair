@@ -179,50 +179,38 @@ Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn
 
 Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the env gates in the serve line to match production first).
 
-## Running on a single Spark (`TP=1`)
+## One Spark or two
 
-The same stack runs on one node — pass `TP=1` and the launcher drops everything two-node:
-ray, the patched-NCCL striping, and the rank-1 cache server (the connector is pointed at the
-local one only). Phases 1, 6 and 7 become unnecessary; nothing else changes. Every patch still
-applies, including the #48425 guard and the lmcache heartbeat fix, neither of which is about
-node count.
+Everything in this recipe runs on **either a single Spark or a pair** — `TP` is the switch, and
+it is the only thing you change. `TP=2` (default) uses ray, two-rail RoCE striping and a cache
+server per rank; `TP=1` drops all three, and the launcher skips those gates rather than failing
+them.
 
 ```
-docker exec -d <container> bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
-docker exec -d <container> bash -c "TP=1 LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 bash /ws/run-serve-tp2-v2.sh > /ws/logs/serve.log 2>&1"
+bash scripts/start-stack.sh            # 2x Spark (default)
+TP=1 bash scripts/start-stack.sh       # 1x Spark
 ```
 
-Expect roughly, extrapolated from the measured TP2 scaling (verify against your own
-`GPU KV cache size:` line on first boot rather than trusting these):
+On a single node, **phases 1, 6 and 7 below are unnecessary** — no fabric to qualify, no patched
+NCCL to build, nothing to replicate. Everything else is identical, including all four patches:
+the #48425 guard and the lmcache heartbeat fix are about hybrid KV groups and cache liveness,
+not node count.
 
-| | 2× Spark | 1× Spark |
+| | 2x Spark | 1x Spark |
 |---|---:|---:|
-| Decode, single stream | 27 tok/s | ~17 tok/s |
+| Decode, single stream | 27–28.6 tok/s | ~17 tok/s |
 | Cold prefill | ~1,375 tok/s | ~700 tok/s |
 | Aggregate @ 64 streams | 275 tok/s | ~160 tok/s |
 | GPU KV pool @ `GPUMEM=0.70` | ~3.9M tokens | ~1.65M tokens |
+| Needs ray / striping / 2nd cache server | yes | no |
 
-The pool roughly halves for two compounding reasons: one node now carries all 21.6 GB of
-weights instead of half, and with no tensor parallelism every KV head lives on the one GPU, so
-per-token cost doubles. Consider lowering `--max-num-seqs` from 64 to match — a third of the
-pool shared by the same 64 streams leaves each one much less room. The NVMe cache tier matters
-more here, not less, since there is a smaller GPU pool for it to back.
+The pool roughly halves for two compounding reasons: one node carries all 21.6 GB of weights
+instead of half, and with no tensor parallelism every KV head lives on the one GPU, so per-token
+cost doubles. Consider lowering `--max-num-seqs` to match. The NVMe cache tier matters *more*
+on a single node, not less, since there is a smaller GPU pool behind it.
 
-## Published profile
-
-A sanitized, portable record of this exact deployment — manifest, compose template, env example,
-and a correctness test — lives in the
-[inference-runtime-profiles](https://github.com/FujitsuPolycom/inference-runtime-profiles/tree/master/profiles/qwen38-27b-exl3-k5k6-mtp2-lmcache-2x-spark)
-repository. **That is the single source of truth for configuration values and measurements**; this
-repository is the build recipe, scripts, and patches. (A copy of the bundle previously lived here
-and drifted out of date — it has been removed rather than maintained in two places.)
-
-## Chat template note
-
-`chat_template_agentic.jinja` defaults `reasoning_effort` to **medium**, which injects no reasoning
-instruction. `xhigh` and `low` each inject one sentence of guidance. Override per request through
-`chat_template_kwargs` — a top-level `reasoning_effort` field in the request body is ignored by this
-template.
+The 1x figures are extrapolated from the measured TP2 scaling, not directly benchmarked —
+verify against your own `GPU KV cache size:` line on first boot.
 
 ## Phase 10 — Validation gauntlet
 
@@ -250,6 +238,7 @@ template.
 | −25–30% single-stream after enabling striping | Too many rails/channels (SM contention in decode graphs). 2 rails, 2 channels, one port per card. |
 | Throughput drops ~20% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
 | NCCL probe shows ~2.3 ms latency floor | You benchmarked beside the live engine — GB10 context timeslicing phantom. Quiesce first. |
+| Container loses the GPU: `Failed to initialize NVML: Unknown Error` (often after `systemctl daemon-reload`) | Known NVIDIA container-toolkit issue with cgroups v2 + systemd driver ([#48](https://github.com/NVIDIA/nvidia-container-toolkit/issues/48)). **Prevent it** with `sudo nvidia-ctk system create-dev-char-symlinks --create-all` at boot. `docker restart <container>` recovers a container that has already lost access; `scripts/boot-stack-aa42.sh` detects and does this automatically. |
 | Engine won't start: `Free memory on device cuda:0 (N/121 GiB) ... less than desired GPU memory utilization` | The cache servers are still holding the **previous** engine's KV cache through CUDA IPC — check `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` for an `lmcache` PID holding tens of GB with tiny RSS. Restart the cache servers to release it. Correct restart order is always **kill engine -> cycle cache servers -> start engine**. |
 | Garbage/multilingual output on shared-prefix requests under memory pressure | You skipped the #48425 port in `fork-ports.patch`. |
 

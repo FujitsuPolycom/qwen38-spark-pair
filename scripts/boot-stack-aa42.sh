@@ -21,6 +21,8 @@ set -x
 WS="$HOME/work/qwen38-exl3"
 C0=ggrun
 RANK1=198.18.200.2
+TP="${TP:-2}"                                  # 1 = single Spark, 2 = the pair
+MULTI=$([ "$TP" -gt 1 ] && echo 1 || echo 0)
 API=http://127.0.0.1:8000
 
 # 0. Already healthy? Do nothing.
@@ -58,8 +60,13 @@ done
 # 4. Ray head. STRIPE is passed explicitly even though tp2-env.sh now defaults
 #    to 2 — NCCL runs in the ray workers and inherits this at `ray start` time,
 #    so being wrong here silently costs a rail.
-docker exec "$C0" bash -c "STRIPE=2 bash /ws/tp2-ray-head.sh"
+if [ "$MULTI" = "1" ]; then
+    docker exec "$C0" bash -c "STRIPE=2 bash /ws/tp2-ray-head.sh"
+else
+    echo "boot: TP=1 - no ray cluster needed"
+fi
 
+if [ "$MULTI" = "1" ]; then
 # 5. Wait for rank 1 to join — and re-trigger its join periodically.
 #    Race this heals: tp2-ray-head.sh does `ray stop --force` before
 #    `ray start --head`, so a rank 1 that joined the PREVIOUS head is silently
@@ -74,6 +81,7 @@ for i in $(seq 1 120); do
     fi
     sleep 5
 done
+fi
 
 # 6. Cache servers: ALWAYS cycle both, never reuse.
 #    A surviving cache server holds the previous engine's KV cache through CUDA
@@ -81,22 +89,26 @@ done
 #    "Free memory on device cuda:0 ... less than desired GPU memory utilization".
 #    Harmless on a true cold boot (nothing survives); essential whenever this
 #    script is used to recover a warm machine.
-docker exec "$C0" bash -c 'pkill -f "[l]mcache server"; true'
+[ "$MULTI" = "1" ] && docker exec "$C0" bash -c 'pkill -f "[l]mcache server"; true'
 ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec ggbuild bash -c 'pkill -f \"[l]mcache server\"; true'" || true
 sleep 6
 
-docker exec -d "$C0" bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
+[ "$MULTI" = "1" ] && docker exec -d "$C0" bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
 ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec -d ggbuild bash -c 'RANK=1 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r1.log 2>&1'" || true
 
 # 7. Wait for BOTH to bind before handing off (the launcher gates on both).
 for i in $(seq 1 60); do
-    ss -tln | grep -q ':6556 ' &&       ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1" "ss -tln | grep -q ':6556 '" && break
-    sleep 3
+    if [ "$MULTI" = "1" ]; then
+      ss -tln | grep -q ':6556 ' && ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1" "ss -tln | grep -q ':6556 '" && break
+    else
+      ss -tln | grep -q ':6556 ' && break
+    fi
+
 done
 ss -tln | grep -q ':6556 ' || { echo "boot: FATAL — rank 0 cache server never bound 6556"; exit 1; }
 
 # 8. Hand off to the gated launcher with the production configuration.
 #    It re-checks everything above and refuses to start a degraded stack.
-cd "$WS" && LMC=1 APC=1 STRIPE=2 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 \
+cd "$WS" && TP=$TP LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 \
     bash start-stack.sh
 echo "boot: start-stack.sh exited $?"
