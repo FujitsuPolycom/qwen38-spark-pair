@@ -1,0 +1,153 @@
+# Per-node services for the Qwen3.8-27B EXL3 two-Spark TP2 profile.
+#
+# Run this file on BOTH nodes with the node's own .env (NODE_RANK 0 or 1).
+# Ray bring-up is intentionally NOT in compose: it is order-dependent across
+# nodes (head must be up and joined before the engine starts), so it stays in
+# the recipe repository's scripts. Sequence:
+#
+#   [both]  docker compose up -d lmcache
+#   [rank0] <ray head script>
+#   [rank1] <ray worker script>
+#   [rank0] docker compose up -d inference
+#
+# The runtime image is built from source per the recipe repository; there is no
+# published image for this profile.
+
+services:
+  lmcache:
+    image: ${RUNTIME_IMAGE}
+    container_name: lmcache-server
+    network_mode: host
+    ipc: host
+    restart: unless-stopped
+    gpus: all
+    volumes:
+      - ${WORK_DIR}:/ws:rw
+    environment:
+      LMCACHE_DISABLE_BANNER: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+    entrypoint: ["lmcache", "server"]
+    command:
+      - --instance-id
+      - "${LMCACHE_INSTANCE_ID}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${LMCACHE_PORT}"
+      # Must equal the model's mamba block size (1600). A chunk that is not a
+      # multiple of the block is rejected at startup.
+      - --chunk-size
+      - "${LMCACHE_CHUNK_SIZE}"
+      - --max-gpu-workers
+      - "${LMCACHE_GPU_WORKERS}"
+      - --max-cpu-workers
+      - "${LMCACHE_CPU_WORKERS}"
+      - --supported-transfer-mode
+      - lmcache_driven
+      # L1 lives in unified memory (shared with the model). Size it to at least
+      # the longest prefix you expect to replay: a lookup only counts an L2 hit
+      # after staging chunks into L1, so an undersized L1 silently answers zero.
+      - --l1-size-gb
+      - "${LMCACHE_L1_GB}"
+      - --l1-use-lazy
+      - --l1-init-size-gb
+      - "0"
+      - --eviction-policy
+      - LRU
+      - --l2-adapter
+      - '{"type":"fs_native","base_path":"/ws/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAP_GB}}'
+
+  # Engine: start on rank 0 only. Rank 1 contributes its GPU through ray.
+  inference:
+    image: ${RUNTIME_IMAGE}
+    container_name: inference-server
+    network_mode: host
+    ipc: host
+    restart: "no"
+    gpus: all
+    cap_add:
+      - IPC_LOCK
+    devices:
+      - /dev/infiniband
+    depends_on:
+      - lmcache
+    volumes:
+      - ${WORK_DIR}:/ws:rw
+    environment:
+      # EXL3 kernel gates
+      VLLM_EXL3_GRAPH_DECODE: "1"
+      VLLM_EXL3_PREFILL_FP8: "1"
+      # Default 128 collides with MTP-inflated decode batches (32 seqs x 4 rows
+      # = exactly 128 -> prefill-style reconstruct during decode, -18% at cc32).
+      VLLM_EXL3_PREFILL_RECONSTRUCT_M: "256"
+      # Patched NCCL injection (two-rail striping)
+      LD_PRELOAD: ${PATCHED_NCCL_LIBRARY}
+      VLLM_NCCL_SO_PATH: ${PATCHED_NCCL_LIBRARY}
+      NCCL_IB_HCA: ${NCCL_IB_HCA}
+      NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX}
+      # Required for parallel rails between a single rank pair: the
+      # subnet-aware path collapses every channel onto one card.
+      NCCL_IB_SUBNET_AWARE_ROUTING: ${NCCL_IB_SUBNET_AWARE_ROUTING}
+      NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS}
+      NCCL_CROSS_NIC: ${NCCL_CROSS_NIC}
+      NCCL_MIN_NCHANNELS: ${NCCL_MIN_NCHANNELS}
+      NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS}
+      NCCL_ALGO: ${NCCL_ALGO}
+      NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE}
+      NCCL_SOCKET_IFNAME: ${FABRIC_IFACE}
+      GLOO_SOCKET_IFNAME: ${FABRIC_IFACE}
+      VLLM_HOST_IP: ${RANK0_FABRIC_ADDR}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+    entrypoint: ["vllm", "serve"]
+    command:
+      - /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated
+      - --served-model-name
+      - ${SERVED_MODEL_NAME}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${API_PORT}"
+      # EXL3 self-configures from the checkpoint's quantization_config.json;
+      # do not pass --quantization-config (removed at fork head).
+      - --quantization
+      - exl3
+      - --tensor-parallel-size
+      - "2"
+      - --distributed-executor-backend
+      - ray
+      - --max-model-len
+      - "${MAX_MODEL_LEN}"
+      - --max-num-seqs
+      - "${MAX_NUM_SEQS}"
+      # MUST be in [1600, 3200) while the LMCache connector is attached: the
+      # mamba-align guard requires each prefill step to advance exactly one
+      # block so every chunk boundary holds a real recurrent-state snapshot.
+      - --max-num-batched-tokens
+      - "${BATCHTOK}"
+      - --gpu-memory-utilization
+      - "${GPU_MEMORY_UTILIZATION}"
+      - --kv-cache-dtype
+      - "${KVDTYPE}"
+      - --enable-prefix-caching
+      - --mamba-cache-mode
+      - align
+      # Driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX. All
+      # three backend pins are required; the MTP drafter resolves its own
+      # backend and crashes without the one inside speculative-config.
+      - --attention-backend
+      - TRITON_ATTN
+      - --mm-encoder-attn-backend
+      - TORCH_SDPA
+      - --speculative-config
+      - '{"method":"qwen3_5_mtp","num_speculative_tokens":${MTPK},"attention_backend":"TRITON_ATTN"}'
+      - --compilation-config
+      - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+      - --kv-transfer-config
+      - '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.server_urls":["tcp://${RANK0_LAN_ADDR}:${LMCACHE_PORT}","tcp://${RANK1_LAN_ADDR}:${LMCACHE_PORT}"],"lmcache.mp.mq_timeout":${LMCACHE_MQ_TIMEOUT},"lmcache.mp.heartbeat_interval":${LMCACHE_HEARTBEAT_INTERVAL}}}'
+      - --chat-template
+      - /ws/chat_template_agentic.jinja
+      - --reasoning-parser
+      - qwen3
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-auto-tool-choice
