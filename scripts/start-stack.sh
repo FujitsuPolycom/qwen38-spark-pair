@@ -197,7 +197,7 @@ fi
 
 # ---- launch ----------------------------------------------------------------
 step "Launching engine"
-info "LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM"
+info "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM"
 info "log: $LOG"
 # No host-side truncate: the file is root-owned inside the container, and bash
 # reports a failed `>` before any `2>/dev/null` on the same line can suppress

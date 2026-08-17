@@ -14,5 +14,5 @@ exec lmcache server \
   --chunk-size 1600 \
   --max-gpu-workers 2 --max-cpu-workers 2 \
   --supported-transfer-mode lmcache_driven \
-  --l1-size-gb 4 --l1-use-lazy --l1-init-size-gb 0 --eviction-policy LRU \
+  --l1-size-gb 8 --l1-use-lazy --l1-init-size-gb 0 --eviction-policy LRU \
   --l2-adapter '{"type":"fs_native","base_path":"/ws/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":200}'
