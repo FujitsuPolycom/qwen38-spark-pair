@@ -190,7 +190,7 @@ Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the en
 
 ## Known limitations
 
-Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Long-context (100K+) concurrency untested. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
+Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's RTX 5090 receipts; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the KV pool caps that regime at roughly 14 streams at 131K or 7 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
 
 ## Credits
 
