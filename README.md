@@ -143,8 +143,24 @@ Order matters: cache servers → ray head → ray worker → engine.
 [r1] docker exec -d ggbuild bash -c "RANK=1 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r1.log 2>&1"
 [r0] docker exec ggrun   bash /ws/tp2-ray-head.sh
 [r1] docker exec ggbuild bash /ws/tp2-ray-worker.sh
-[r0] docker exec -d ggrun bash -c "LMC=1 APC=1 STRIPE=2 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 bash /ws/run-serve-tp2-v2.sh > /ws/logs/serve.log 2>&1"
+[r0] bash scripts/start-stack.sh          # gated launcher — see below
 ```
+
+**Use `scripts/start-stack.sh` rather than launching the engine by hand.** It refuses to start
+on any failed precondition instead of leaving you a half-dead stack and a traceback whose real
+cause is buried: no stale engine holding GPUs, ray reporting enough *free* GPUs (a not-yet-released
+actor from the previous engine makes vLLM see one GPU and fail the TP2 placement group), cache
+servers listening on both ranks, the lmcache heartbeat patch actually present, weights and patched
+NCCL on both ranks, disk for the L2 tier. It then verifies the engine answered `/v1/models` and
+that the heartbeat thread started, and on failure prints the *first* real error rather than the
+traceback tail. `bash scripts/start-stack.sh --check` runs the gates read-only and leaves a running
+engine untouched.
+
+**Critical restart rule: kill engine → cycle cache servers → start engine.** The LMCache MP servers
+hold the engine's KV cache through CUDA IPC and never release it when the engine exits (69 GB
+observed held by a server whose RSS was 4.8 GB). Restarting only the engine can therefore fail with
+`Free memory on device cuda:0 … less than desired GPU memory utilization`; cycling the servers frees
+it immediately.
 
 The serve script's gates (each is one env var + restart to A/B):
 
@@ -154,7 +170,9 @@ The serve script's gates (each is one env var + restart to A/B):
 | `APC` | 1 | prefix caching + `--mamba-cache-mode align` (safe only because of the #51113 port) |
 | `STRIPE` | 2 | 2-rail patched-NCCL transport (0 = stock single-cable) |
 | `MTPK` | 2 | MTP speculative depth (2 = throughput mode; 3 = +6% single-stream, −4% @cc64) |
-| `KVDTYPE` | fp8 | FP8 KV cache — doubles the KV pool (~1.78M tokens at gpu-mem 0.40) |
+| `KVDTYPE` | fp8 | FP8 KV cache — doubles the KV pool |
+| `GPUMEM` | 0.70 | fraction of **unified** memory for the engine. Measured pools: 0.40 → 1,842,455 tokens · 0.55 → 2,852,305 · 0.70 → ~3.9M. Community guidance for GB10 is ≤0.70 — the usual discrete-GPU 0.85–0.95 does not apply, since the OS, page cache, ray and the cache servers draw from the same pool |
+| `TP` | 2 | 1 = single Spark (drops ray, striping, rank-1 cache server) |
 | `STAGE` | graph | EXL3 CUDA-graph decode (+25% vs eager) |
 
 Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn-backend TORCH_SDPA`, and `"attention_backend":"TRITON_ATTN"` **inside** the speculative config — all three pins exist because driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX; the drafter crashes without its own pin. `VLLM_EXL3_PREFILL_FP8=1` (2.16× prefill) and `VLLM_EXL3_PREFILL_RECONSTRUCT_M=256` (the default 128 collides with MTP-inflated decode batches at cc32) are exported by the script.
@@ -182,13 +200,29 @@ Expect roughly, extrapolated from the measured TP2 scaling (verify against your 
 | Decode, single stream | 27 tok/s | ~17 tok/s |
 | Cold prefill | ~1,375 tok/s | ~700 tok/s |
 | Aggregate @ 64 streams | 275 tok/s | ~160 tok/s |
-| GPU KV pool @ `GPUMEM=0.70` | 3.94M tokens | ~1.65M tokens |
+| GPU KV pool @ `GPUMEM=0.70` | ~3.9M tokens | ~1.65M tokens |
 
 The pool roughly halves for two compounding reasons: one node now carries all 21.6 GB of
 weights instead of half, and with no tensor parallelism every KV head lives on the one GPU, so
 per-token cost doubles. Consider lowering `--max-num-seqs` from 64 to match — a third of the
 pool shared by the same 64 streams leaves each one much less room. The NVMe cache tier matters
 more here, not less, since there is a smaller GPU pool for it to back.
+
+## Published profile
+
+A sanitized, portable record of this exact deployment — manifest, compose template, env example,
+and a correctness test — lives in the
+[inference-runtime-profiles](https://github.com/FujitsuPolycom/inference-runtime-profiles/tree/master/profiles/qwen38-27b-exl3-k5k6-mtp2-lmcache-2x-spark)
+repository. **That is the single source of truth for configuration values and measurements**; this
+repository is the build recipe, scripts, and patches. (A copy of the bundle previously lived here
+and drifted out of date — it has been removed rather than maintained in two places.)
+
+## Chat template note
+
+`chat_template_agentic.jinja` defaults `reasoning_effort` to **medium**, which injects no reasoning
+instruction. `xhigh` and `low` each inject one sentence of guidance. Override per request through
+`chat_template_kwargs` — a top-level `reasoning_effort` field in the request body is ignored by this
+template.
 
 ## Phase 10 — Validation gauntlet
 
@@ -215,6 +249,7 @@ more here, not less, since there is a smaller GPU pool for it to back.
 | −25–30% single-stream after enabling striping | Too many rails/channels (SM contention in decode graphs). 2 rails, 2 channels, one port per card. |
 | Throughput drops ~20% at cc32 specifically | `VLLM_EXL3_PREFILL_RECONSTRUCT_M` left at default 128 (collides with 32×4 MTP batches). Use 256. |
 | NCCL probe shows ~2.3 ms latency floor | You benchmarked beside the live engine — GB10 context timeslicing phantom. Quiesce first. |
+| Engine won't start: `Free memory on device cuda:0 (N/121 GiB) ... less than desired GPU memory utilization` | The cache servers are still holding the **previous** engine's KV cache through CUDA IPC — check `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` for an `lmcache` PID holding tens of GB with tiny RSS. Restart the cache servers to release it. Correct restart order is always **kill engine -> cycle cache servers -> start engine**. |
 | Garbage/multilingual output on shared-prefix requests under memory pressure | You skipped the #48425 port in `fork-ports.patch`. |
 
 ## Known limitations
