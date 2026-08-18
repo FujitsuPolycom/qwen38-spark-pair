@@ -232,6 +232,11 @@ if [ "$up" != "1" ]; then
         | grep -viE "min_frames|max_frames|not documented" | head -5 \
         || tail -5 "$LOG"
     echo
+    # Preserve the evidence. Every launch truncates $LOG, so without this copy
+    # the next launch destroys the failed one's diagnostics -- which makes a
+    # failure inside a sweep unreadable by the time the sweep ends.
+    FAILED_LOG="${LOG%.log}-failed-$(date +%Y%m%d-%H%M%S).log"
+    cp "$LOG" "$FAILED_LOG" 2>/dev/null         && info "failure log preserved: $FAILED_LOG"
     info "full log: $LOG"
     exit 20
 fi
