@@ -294,8 +294,10 @@ The serve script's gates (each is one env var + restart to A/B):
 | `GPUMEM` | 0.70 | fraction of **unified** memory for the engine. Measured pools: 0.40 → 1,842,455 tokens · 0.55 → 2,852,305 · 0.70 → ~3.9M. Community guidance for GB10 is ≤0.70 — the usual discrete-GPU 0.85–0.95 does not apply, since the OS, page cache, ray and the cache servers draw from the same pool |
 | `TP` | 2 | 1 = single Spark (drops ray, striping, rank-1 cache server) |
 | `STAGE` | graph | EXL3 CUDA-graph decode (+25% vs eager) |
+| `RECON_M` | 256 | EXL3 prefill reconstruction tile (`VLLM_EXL3_PREFILL_RECONSTRUCT_M`). Prefill-only; 128 collides with MTP-inflated decode batches at cc32 |
+| `FP8PREFILL` | 1 | FP8 prefill GEMM (2.16x prefill). Prefill-only E4M3 numerics; decode keeps the exact trellis kernels |
 
-Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn-backend TORCH_SDPA`, and `"attention_backend":"TRITON_ATTN"` **inside** the speculative config — all three pins exist because driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX; the drafter crashes without its own pin. `VLLM_EXL3_PREFILL_FP8=1` (2.16× prefill) and `VLLM_EXL3_PREFILL_RECONSTRUCT_M=256` (the default 128 collides with MTP-inflated decode batches at cc32) are exported by the script.
+Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn-backend TORCH_SDPA`, and `"attention_backend":"TRITON_ATTN"` **inside** the speculative config — all three pins exist because driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX; the drafter crashes without its own pin. The `RECON_M` and `FP8PREFILL` gates above set `VLLM_EXL3_PREFILL_RECONSTRUCT_M` and `VLLM_EXL3_PREFILL_FP8`; both default to the production values, so leaving them unset is the same as passing them.
 
 Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the env gates in the serve line to match production first).
 
