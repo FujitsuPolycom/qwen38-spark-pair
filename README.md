@@ -95,10 +95,19 @@ docker run -d --name <ggrun|ggbuild> --restart unless-stopped \
 
 ```bash
 sudo nvidia-ctk system create-dev-char-symlinks --create-all
-sudo tee /etc/cron.d/nvidia-dev-char <<< "@reboot root /usr/bin/nvidia-ctk system create-dev-char-symlinks --create-all"
+sudo tee /etc/cron.d/nvidia-dev-char <<< "@reboot root /usr/bin/nvidia-ctk system create-dev-char-symlinks --create-all >/dev/null 2>&1"
 ```
 
-   (The symlinks do not persist across reboots — the cron.d entry recreates them at boot.)
+   (The symlinks do not persist across reboots — the cron.d entry recreates them at boot. The
+   redirect keeps cron from mailing root the command's warnings every boot.)
+
+   **The output looks alarming and is not.** Expect many `WARN ... unable to detect IOMMU FD`
+   and `unable to get device name` lines — the tool probes for VFIO/IOMMU paths that a Spark
+   does not have. On a node where some links already exist, expect `Could not create symlink:
+   ... file exists` for each. The command is idempotent; neither warning is a failure.
+
+**Verify:** `ls /dev/char | wc -l` returns a few hundred entries (357 on the reference pair, which
+varies with driver capability count) and `ls -l /dev/char/195:0` resolves to `../nvidia0`.
 
    `scripts/boot-stack-aa42.sh` (the boot-persistence script installed in Phase 9) also detects the condition and restarts the container, but preventing it
    is better than recovering from it — the recovery costs a restart cycle and only fires at boot.
