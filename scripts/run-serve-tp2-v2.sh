@@ -3,14 +3,16 @@
 # Run inside the ggrun container on spark-aa42 AFTER ray head+worker are up.
 #
 # A/B gates. Bare defaults are the A/B baseline — the PRODUCTION
-# configuration is what start-stack.sh passes (TP=2 LMC=1 APC=1 STRIPE=2 MTPK=2
+# configuration is what start-stack.sh passes (TP=2 LMC=1 APC=1 STRIPE=2 MTPK=3
 # KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70):
 #   STAGE=graph|eager   graph = EXL3 CUDA-graph decode (validated 3/3 vs eager, +25%)
 #   APC=0|1             1 = prefix caching + mamba align (scheduler fix ported, 20/20
 #                       regression tests; not yet live-validated)
 #   FP8PREFILL=1|0      FP8 prefill GEMM: 662 -> 1433 tok/s measured; prefill-only
 #                       E4M3 numerics, decode keeps exact trellis kernels
-#   MTPK=3              speculative depth (community favors 2 under concurrency)
+#   MTPK=3              speculative depth. 3 measured faster than 2 at TP2 on both
+#                       single-stream (+9.0%) and 4-stream (+3.5%) with prefill flat;
+#                       2 is the safer choice for saturated many-stream serving.
 #   BATCHTOK=8192       max-num-batched-tokens (sweep: 3072/4096/8192)
 #   TP=2                1 = single Spark (drops ray, striping, rank-1 cache server;
 #                       expect ~17 tok/s decode, ~700 prefill, ~1.65M KV @ GPUMEM=0.70)

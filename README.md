@@ -295,7 +295,7 @@ The serve script's gates (each is one env var + restart to A/B):
 | `LMC` | 1 | LMCache connector on. **Forces `BATCHTOK ∈ [1600,3200)`** — the mamba-align guard; 3072 is the best legal value (~8% cold-prefill cost, invisible under concurrent load). `LMC=0` → use `BATCHTOK=8192` |
 | `APC` | 1 | prefix caching + `--mamba-cache-mode align` (safe only because of the #51113 port) |
 | `STRIPE` | 2 | 2-rail patched-NCCL transport (0 = stock single-cable) |
-| `MTPK` | 2 | MTP speculative depth (2 = throughput mode; 3 = +6% single-stream, −4% @cc64) |
+| `MTPK` | 3 | MTP speculative depth. Measured at TP2, ctx 4096, six samples per depth: depth 3 raises single-stream from 29.37 to 32.01 tok/s (+9.0%) and four-stream aggregate from 107.6 to 111.4 (+3.5%), both larger than the combined standard error, while prefill moves −1% (1359 → 1348 tok/s at 4K). Mean acceptance is 2.95 tokens per step at depth 3 against 2.5–2.65 at depth 2. Depth 2 remains the safer choice for saturated many-stream serving, which these measurements do not cover |
 | `KVDTYPE` | fp8 | FP8 KV cache — doubles the KV pool |
 | `GPUMEM` | 0.70 | fraction of **unified** memory for the engine. Measured pools: 0.40 → 1,842,455 tokens · 0.55 → 2,852,305 · 0.70 → ~3.9M. Community guidance for GB10 is ≤0.70 — the usual discrete-GPU 0.85–0.95 does not apply, since the OS, page cache, ray and the cache servers draw from the same pool |
 | `TP` | 2 | 1 = single Spark (drops ray, striping, rank-1 cache server) |
@@ -323,9 +323,9 @@ TP=1 bash scripts/start-stack.sh
 Full production launch, either way:
 
 ```bash
-TP=2 LMC=1 APC=1 STRIPE=2 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
+TP=2 LMC=1 APC=1 STRIPE=2 MTPK=3 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
 
-TP=1 LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
+TP=1 LMC=1 APC=1 MTPK=3 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70   bash scripts/start-stack.sh
 ```
 
 On a single node, **phases 1, 6 and 7 are unnecessary** — no fabric to qualify, no patched NCCL

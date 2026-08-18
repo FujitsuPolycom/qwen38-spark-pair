@@ -118,6 +118,6 @@ ss -tln | grep -q ':6556 ' || { echo "boot: FATAL — rank 0 cache server never 
 
 # 8. Hand off to the gated launcher with the production configuration.
 #    It re-checks everything above and refuses to start a degraded stack.
-cd "$WS" && TP=$TP LMC=1 APC=1 MTPK=2 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 \
+cd "$WS" && TP=$TP LMC=1 APC=1 MTPK=3 KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70 \
     bash start-stack.sh
 echo "boot: start-stack.sh exited $?"
