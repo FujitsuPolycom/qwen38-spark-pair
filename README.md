@@ -246,12 +246,12 @@ Copy `/ws/{venv,src,model,nccl-patched,patches}` and all `scripts/*` to rank1's 
 cd /ws/venv/lib/python3.12/site-packages && patch -p1 < /ws/patches/lmcache-0.5.2-heartbeat-fix.patch
 ```
 
-Stock 0.5.2's scheduler-side heartbeat never starts (a `{} is not None` dead guard); the servers reap the engine ~2.5 min after start and **every cache lookup silently returns 0 forever** while stores keep working. Benchmarks pass (they query right after restart); production silently loses the tier.
+Stock 0.5.2 initializes the scheduler adapter's heartbeat registry to `{}` and then guards the lazy starter with `if self._heartbeats is not None:`. An empty dict is not `None`, so the guard always returns and the thread-creation loop is unreachable: the process never logs `Started PeriodicThread: lmcache-heartbeat`, and each server's health event stays at its constructed value, so the scheduler's view of server health is permanently healthy and it never enters degraded mode. Observed on this stack before the patch: every cache lookup returned 0 while stores kept working, and benchmarks still passed because they query right after a restart. Treat the link between defect and symptom as observed rather than established -- `lmcache.mp.mq_timeout` was raised from 10 to 60 in the same change window, so the field A/B does not isolate the patch. The defect itself is unambiguous in the source and the fix is two characters, so apply it either way.
 
 3. [both] NVMe cache dir `mkdir -p /ws/lmcache-l2`.
 4. Server config is `scripts/lmcache-server.sh` — one server per rank, port 6556. Sizing rules baked in, don't lower them casually:
    - `--chunk-size 1600` — must equal this model's mamba block (1600); chunks are ~106 MB each per rank.
-   - `--l1-size-gb 4` — lookups only count a hit after staging chunks into L1, so **L1 must be ≥ your largest replayed prefix** or lookups silently answer 0.
+   - `--l1-size-gb 8` — lookups only count a hit after staging chunks into L1, so **L1 must be ≥ your largest replayed prefix** or lookups silently answer 0. A hit found on NVMe still needs an L1 write reservation, and the default trim policy truncates the answer at the first reservation failure, so a prefix one chunk too large for L1 collapses to zero hits rather than a partial hit.
    - `fs_native` L2, `use_odirect:false`, capacity to taste (`max_capacity_gb`).
 
 ## Phase 9 — Launch
@@ -277,10 +277,13 @@ traceback tail. `bash scripts/start-stack.sh --check` runs the gates read-only a
 engine untouched.
 
 **Critical restart rule: kill engine → cycle cache servers → start engine.** The LMCache MP servers
-hold the engine's KV cache through CUDA IPC and never release it when the engine exits (69 GB
-observed held by a server whose RSS was 4.8 GB). Restarting only the engine can therefore fail with
-`Free memory on device cuda:0 … less than desired GPU memory utilization`; cycling the servers frees
-it immediately.
+import the engine's KV tensors through CUDA IPC (69 GB observed held by a server whose RSS was
+4.8 GB). A clean engine shutdown unregisters the mapping and the server releases it immediately, but
+an abrupt exit sends nothing, and release then waits on the server's reaper -- 120 to 150 s at the
+default `--worker-reap-timeout-seconds 120`, whose scan runs every quarter of that interval. A
+restart faster than that window fails with `Free memory on device cuda:0 … less than desired GPU
+memory utilization`. Cycling the servers frees the memory at once and does not depend on how the
+engine died.
 
 The serve script's gates (each is one env var + restart to A/B):
 
