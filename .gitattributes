@@ -1,4 +1,7 @@
+# The scripts are executed by bash on Linux hosts and are copied there
+# directly from a checkout. A CRLF checkout produces `syntax error near
+# unexpected token $'do\r'` at run time, so these paths are pinned to LF
+# regardless of the platform doing the checkout.
 *.sh text eol=lf
 *.patch text eol=lf
 *.jinja text eol=lf
-README.md text eol=lf
