@@ -1,10 +1,10 @@
 # qwen38-spark-pair
 
-**A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on 2× NVIDIA DGX Spark (GB10) at TP2**, with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, 2-rail RoCE striping, prefix caching, and an LMCache L1+NVMe KV tier.
+**A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on one or two NVIDIA DGX Spark (GB10) nodes** — `TP=1` on a single Spark or `TP=2` across a pair — with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, prefix caching, an LMCache L1+NVMe KV tier, and (at `TP=2`) 2-rail RoCE striping. Despite the repository name, one Spark is enough: `TP=1` drops the fabric phases entirely ([One Spark or two](#one-spark-or-two)).
 
-Measured on one such pair — the "reference pair" referenced throughout: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+Measured on one such pair — the "reference pair" referenced throughout: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** A single Spark at `TP=1` serves the same stack at **23.8 tok/s single-stream · 85 tok/s aggregate @ 4 streams** with a 1.67M-token KV pool. Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
 
-This document is written to be executed by an LLM agent with SSH access to both Sparks. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
+This document is written to be executed by an LLM agent with SSH access to the Spark — or both Sparks at `TP=2`. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
 > The [sparkring](https://github.com/FujitsuPolycom/sparkring) project (same maintainer) supplies two ingredients: the switchless-ring NCCL patches built in Phase 6 and the container image pin in Phase 2. This repository consumes them at pinned revisions and modifies neither sparkring nor any other upstream.
 
@@ -12,8 +12,8 @@ This document is written to be executed by an LLM agent with SSH access to both 
 
 ## What you need
 
-- 2× DGX Spark (GB10, ~121 GB unified memory each), DGX OS (Ubuntu 24.04.4 LTS as tested) with **driver 580.173.02** (any 580.x should behave identically) (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see the Phase 9 backend pins), Docker with NVIDIA runtime.
-- 2–4 direct 200G QSFP cables between the pair's ConnectX-7 ports (2 minimum, one per card; 4 harmless, only 2 are used).
+- 1× or 2× DGX Spark (GB10, ~121 GB unified memory each — the second Spark is only needed for `TP=2`), DGX OS (Ubuntu 24.04.4 LTS as tested) with **driver 580.173.02** (any 580.x should behave identically) (recipe assumes the driver cannot JIT CUDA-13.2 PTX — see the Phase 9 backend pins), Docker with NVIDIA runtime.
+- `TP=2` only: 2–4 direct 200G QSFP cables between the pair's ConnectX-7 ports (2 minimum, one per card; 4 harmless, only 2 are used).
 - ~80 GB free disk per node (model + build trees + cache tier headroom; NVMe cache cap is configurable).
 - A LAN IP for each node and SSH between them.
 
