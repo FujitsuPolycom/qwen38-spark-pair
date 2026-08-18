@@ -2,7 +2,7 @@
 
 **A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on one or two NVIDIA DGX Spark (GB10) nodes** — `TP=1` on a single Spark or `TP=2` across a pair — with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, prefix caching, an LMCache L1+NVMe KV tier, and (at `TP=2`) 2-rail RoCE striping. Despite the repository name, one Spark is enough: `TP=1` drops the fabric phases entirely ([One Spark or two](#one-spark-or-two)).
 
-Measured on one such pair — the "reference pair" referenced throughout: **27 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 7× replay speedup from NVMe cache · byte-exact greedy outputs throughout.** A single Spark at `TP=1` serves the same stack at **23.8 tok/s single-stream · 85 tok/s aggregate @ 4 streams** with a 1.67M-token KV pool. Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+Measured on one such pair — the "reference pair" referenced throughout: **32.0 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 15.1× replay speedup from the NVMe cache tier · byte-exact greedy outputs throughout.** A single Spark at `TP=1` serves the same stack at **23.8 tok/s single-stream · 85 tok/s aggregate @ 4 streams** with a 1.67M-token KV pool. Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
 
 This document is written to be executed by an LLM agent with SSH access to the Spark — or both Sparks at `TP=2`. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
@@ -335,6 +335,11 @@ cache liveness, not node count.
 ### Measured
 
 Both configurations, same harness, greedy, `GPUMEM=0.70`, `BATCHTOK=3072`, LMCache on.
+The tables below were taken at `MTPK=2`. The production default is `MTPK=3`, which
+measures 32.01 tok/s single-stream and 111.4 tok/s at four streams on the two-Spark
+configuration at 4K context, against 29.37 and 107.6 at `MTPK=2` over six samples each.
+Single-stream throughput varies 11.8% run to run at this scale, so single-sample
+comparisons of two configurations are not meaningful here.
 
 **Two Sparks** — KV pool 3,935,138 tokens
 
@@ -342,8 +347,17 @@ Both configurations, same harness, greedy, `GPUMEM=0.70`, `BATCHTOK=3072`, LMCac
 |---|---:|---:|---:|
 | decode @ 4k ctx | 30.9 | 55.7 | 101.7 |
 | decode @ 16k ctx | 32.2 | 57.8 | 105.6 |
+| decode @ 131k ctx | 33.9 | 47.1 | 86.9 |
 
-Prefill: 1,085 / 1,064 / 1,004 / 918 tok/s at 4k / 8k / 16k / 32k.
+Decode does not degrade with context on this model: single-stream throughput at 131K
+matches 4K within the run-to-run spread. The 131K single-stream figure comes from a
+direct streaming request rather than the benchmark harness, whose warmup gate reports
+an empty cell at one stream and this context length regardless of warmup duration.
+Count response tokens from the stream's usage field, not from stream events: MTP
+delivers about 2.5 accepted tokens per event, so counting events understates decode
+by that factor.
+
+Prefill: 1,085 / 1,064 / 1,004 / 918 tok/s at 4k / 8k / 16k / 32k, and 724 tok/s at 131k.
 Longer runs: 27.0 tok/s single-stream at 256-token generations, 275 tok/s aggregate at 64
 streams, ~1,375 tok/s cold prefill on an 11.5K prompt.
 
@@ -354,10 +368,15 @@ streams, ~1,375 tok/s cold prefill on an 11.5K prompt.
 | decode @ 4k ctx | 23.8 | 43.1 | 85.2 |
 | decode @ 16k ctx | 22.2 | 42.0 | 85.3 |
 
-Prefill: 330 / 398 / 446 / 667 tok/s at 4k / 8k / 16k / 32k. Prefill throughput *rises* with
-context here — fixed per-request overhead dominates at these sizes and amortizes as prompts grow.
+Prefill on the single-Spark configuration is unresolved. One measurement series records
+330 / 398 / 446 / 667 tok/s at 4k / 8k / 16k / 32k, rising with context; a later series on
+the same configuration records 852 tok/s at 4k and 774 at 16k, falling with context. The
+two disagree by more than a factor of two and the cause is not established, so neither is
+published as the single-Spark prefill figure. Two-Spark prefill repeats to within 0.3%
+across runs, so this instability is specific to the single-node configuration.
 
-MTP acceptance runs 2.5–2.65 tokens per step in both configurations.
+MTP acceptance runs 2.5–2.65 tokens per step at `MTPK=2` and 2.95 at `MTPK=3`, in both
+parallelism configurations.
 
 Recommended single-node adjustments: lower `--max-num-seqs` from 64 (the KV pool is smaller, so
 64 streams each get a much thinner slice), and see LMCache sizing below — the chunk size doubles.
@@ -418,9 +437,9 @@ passes).
 2. **Exactness:** a few greedy (`temperature 0`) probes — arithmetic, instruction-following. Re-run each twice: byte-identical.
 3. **Heartbeat (the fix from Phase 8 working):** engine log contains `Started PeriodicThread: lmcache-heartbeat`; server logs show **no** `Reaped GPU instance` while the engine lives.
 4. **APC:** send a ~9K-token prompt twice: second is ~2× faster, byte-identical output.
-5. **Cache tier end-to-end:** send a ~20K-token greedy prompt (cold, time it) → restart the engine (`pkill -f "vllm [s]erve"`, relaunch) → same prompt: expect **~7× faster**, byte-identical, server logs showing `Prefetch request completed ... retained keys` and `Retrieved N tokens`. For the full test also restart the *servers* first — hits then come from NVMe (`0 L1, N L2`).
+5. **Cache tier end-to-end:** send a ~20K-token greedy prompt (cold, time it) → restart the engine (`pkill -f "vllm [s]erve"`, relaunch) → same prompt: expect a large drop in time to first token, byte-identical output, and server logs showing `Prefetch request completed ... retained keys` and `Retrieved N tokens`. Measured on a 30K-token source-code prompt with the cache servers cycled as well as the engine: 61.69 s cold, 4.09 s on replay, a 15.1× reduction, with the engine reporting `External prefix cache hit rate: 97.9%` against a local rate of 0.0%. Cycling the servers is what makes the hit provably external, since the restart clears the engine's own prefix cache. Use content the engine has never seen for the cold pass: a prompt sent even once, including by a request that failed on the client side, is cached server-side and is no longer cold.
 6. **Wait 4+ minutes, replay again** — this specifically catches the heartbeat bug's signature (works-then-silently-stops). Expect hits, not a slow recompute.
-7. **Perf reference (yours should be in the same ballpark):** cc1 ≈ 27 tok/s · cc64 ≈ 275 aggregate · cold prefill ≈ 1,375 tok/s @ BATCHTOK 3072.
+7. **Perf reference (yours should be in the same ballpark):** cc1 ≈ 32 tok/s at `MTPK=3` · cc64 ≈ 275 aggregate · cold prefill ≈ 1,375 tok/s @ BATCHTOK 3072. Single-stream throughput varies about 12% between runs, so compare medians of several runs rather than single values.
 
 ## Troubleshooting (the mistakes already made for you)
 
