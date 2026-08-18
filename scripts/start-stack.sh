@@ -38,6 +38,12 @@ LMC="${LMC:-1}"; APC="${APC:-1}"; MTPK="${MTPK:-2}"
 if [ "$MULTI" = "1" ]; then STRIPE="${STRIPE:-2}"; else STRIPE=0; fi
 KVDTYPE="${KVDTYPE:-fp8}"; STAGE="${STAGE:-graph}"; BATCHTOK="${BATCHTOK:-3072}"
 GPUMEM="${GPUMEM:-0.70}"
+# The serve script reads these too. They are forwarded explicitly below: a gate
+# set in this script's environment but absent from the docker exec line is
+# silently dropped, and the engine then runs its own default while the operator
+# believes the sweep value took effect. The defaults here match the serve
+# script's, so an unset gate behaves identically either way.
+RECON_M="${RECON_M:-256}"; FP8PREFILL="${FP8PREFILL:-1}"; SPEC="${SPEC:-mtp}"
 LOG="${LOG:-$WS/logs/serve-lmc.log}"
 
 # ---- timeouts --------------------------------------------------------------
@@ -197,13 +203,13 @@ fi
 
 # ---- launch ----------------------------------------------------------------
 step "Launching engine"
-info "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM"
+info "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM RECON_M=$RECON_M FP8PREFILL=$FP8PREFILL SPEC=$SPEC"
 info "log: $LOG"
 # No host-side truncate: the file is root-owned inside the container, and bash
 # reports a failed `>` before any `2>/dev/null` on the same line can suppress
 # it. The container's own redirect below truncates it as root regardless.
 docker exec -d "$C0" bash -c \
-    "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM bash /ws/run-serve-tp2-v2.sh > ${LOG/$WS//ws} 2>&1"
+    "TP=$TP LMC=$LMC APC=$APC STRIPE=$STRIPE MTPK=$MTPK KVDTYPE=$KVDTYPE STAGE=$STAGE BATCHTOK=$BATCHTOK GPUMEM=$GPUMEM RECON_M=$RECON_M FP8PREFILL=$FP8PREFILL SPEC=$SPEC bash /ws/run-serve-tp2-v2.sh > ${LOG/$WS//ws} 2>&1"
 
 # ---- verify ----------------------------------------------------------------
 step "Waiting for the engine to answer (timeout ${ENGINE_TIMEOUT}s)"
