@@ -43,7 +43,7 @@ work, rewrite it.
 
 ## Worked distinctions
 
-Each pair below is drawn from prose this repository carries.
+Each pair contrasts a formulation that fails the standard with the corresponding text this repository carries.
 
 | Fails the standard | Satisfies it |
 |---|---|

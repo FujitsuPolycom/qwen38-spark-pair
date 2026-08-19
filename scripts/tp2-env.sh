@@ -19,8 +19,10 @@ export VLLM_HOST_IP=${RANK_IP:?set RANK_IP to this node fabric IP}
 # collectives and silently produces a single-rail run.
 STRIPE="${STRIPE:-2}"
 
-# Tier-1 striping (STRIPE=1): patched NCCL + 4-rail multi-cable striping.
-# Measured: 176 Gb/s aggregate collective bw vs 106 single-card; even 44 Gbps/NIC.
+# STRIPE=1 selects four rails across all four cables. Status: research-only —
+# microbenchmark measures 176 Gb/s aggregate collectives vs 106 single-card,
+# but end-to-end single-stream decode measures -28% vs the two-rail setting,
+# so STRIPE=2 is the served configuration.
 # NOTE: subnet-aware routing OFF — its connector override defeats parallel rails.
 if [ "$STRIPE" = "1" ]; then
   export LD_PRELOAD=/ws/nccl-patched/libnccl.so.2

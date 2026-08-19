@@ -25,7 +25,7 @@ done
 RANK1_HOST="${RANK1_HOST:-${FABRIC_RANK1:-198.18.200.2}}"     # rank 1 over the fabric
 C0="${C0:-ggrun}"                             # rank 0 serving container
 C1="${C1:-ggbuild}"                           # rank 1 serving container
-WS="${WS:-/home/code/work/qwen38-exl3}"       # host work dir (= /ws in container)
+WS="${WS:-$HOME/work/qwen38-exl3}"            # host work dir (= /ws in container) # must be the same absolute path on both nodes
 API="${API:-http://127.0.0.1:8000}"
 LMCACHE_PORT="${LMCACHE_PORT:-6556}"
 TP="${TP:-2}"                                 # 1 = single Spark, 2 = the pair
@@ -33,7 +33,7 @@ TP_SIZE="$TP"
 MULTI=$([ "$TP" -gt 1 ] && echo 1 || echo 0)  # 1 = rank-1 / transport checks apply
 
 # ---- serve gates (passed through to run-serve-tp2-v2.sh) -------------------
-LMC="${LMC:-1}"; APC="${APC:-1}"; MTPK="${MTPK:-2}"
+LMC="${LMC:-1}"; APC="${APC:-1}"; MTPK="${MTPK:-3}"
 # Striping is a two-node concept: with TP=1 there are no collectives to stripe.
 if [ "$MULTI" = "1" ]; then STRIPE="${STRIPE:-2}"; else STRIPE=0; fi
 KVDTYPE="${KVDTYPE:-fp8}"; STAGE="${STAGE:-graph}"; BATCHTOK="${BATCHTOK:-3072}"

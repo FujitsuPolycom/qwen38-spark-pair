@@ -1,7 +1,9 @@
 #!/bin/bash
-# @reboot bootstrap for rank 1 (spark-931e): container -> GPU visibility ->
-# rails -> join ray -> cache server. Rank 0 waits for both the ray join and
-# this node's cache server before launching the engine.
+# @reboot bootstrap for rank 1, intended for installation as a user crontab
+# entry (no sudo). Installing it replaces whatever @reboot line the node's
+# crontab currently carries. Order: container -> GPU visibility -> rails ->
+# join ray -> cache server. Rank 0 waits for both the ray join and this node's
+# cache server before launching the engine.
 #
 # Idempotent: safe to run by hand.
 

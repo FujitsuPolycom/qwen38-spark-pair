@@ -1,7 +1,8 @@
 #!/bin/bash
 # detect-site.sh — probe this machine and emit a filled scripts/site.env.
 #
-# Read-only: it inspects, it never configures. Run on rank 0.
+# Never configures the host; --write writes scripts/site.env and nothing else.
+# Run on rank 0.
 #
 #   bash scripts/detect-site.sh            # print to stdout for review
 #   bash scripts/detect-site.sh --write    # write scripts/site.env
@@ -113,6 +114,8 @@ OUT=$(cat <<CFG
 TP=$TP_D
 
 C0=${C0_D:-REPLACE_WITH_RANK0_CONTAINER}
+# Rank 1's container name is not detectable from rank 0; emitted as the
+# reference default and must be reviewed.
 C1=${C1_D:-ggbuild}
 
 WS=${WS_D:-REPLACE_WITH_WORK_DIR}

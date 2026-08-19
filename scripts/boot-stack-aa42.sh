@@ -1,5 +1,7 @@
 #!/bin/bash
-# @reboot bootstrap for rank 0. Brings a cold or partially-up host to a serving
+# @reboot bootstrap for rank 0, intended for installation as a user crontab
+# entry (no sudo). Installing it replaces whatever @reboot line the node's
+# crontab currently carries. Brings a cold or partially-up host to a serving
 # stack with the production configuration, in this order:
 #   container -> GPU visibility -> rail addresses -> ray head -> wait for rank 1
 #   -> cache servers (always cycled) -> wait for both to bind -> start-stack.sh.
@@ -16,7 +18,7 @@
 #   engine's KV cache through CUDA IPC and starves the next engine start.
 #
 # Idempotent: exits early if the endpoint already answers, so it is safe to run
-# by hand. Installed via user crontab; no sudo required.
+# by hand.
 
 exec > "$HOME/work/qwen38-exl3/logs/boot-aa42.log" 2>&1
 set -x
@@ -66,9 +68,9 @@ for spec in "$RAIL_PREFIX.1.1/24 $NETDEV1" "$RAIL_PREFIX.2.1/24 $NETDEV2" \
     docker exec netadm ip addr add "$1" dev "$2" 2>/dev/null || true
 done
 
-# 4. Ray head. STRIPE is passed explicitly even though tp2-env.sh now defaults
-#    to 2 — NCCL runs in the ray workers and inherits this at `ray start` time,
-#    so being wrong here silently costs a rail.
+# 4. Ray head. STRIPE is passed explicitly at ray start: NCCL runs in the ray
+#    workers and inherits this from the raylet, so an omission here silently
+#    costs a rail regardless of tp2-env.sh's default.
 if [ "$MULTI" = "1" ]; then
     docker exec "$C0" bash -c "STRIPE=2 bash /ws/tp2-ray-head.sh"
 else
@@ -92,18 +94,19 @@ for i in $(seq 1 120); do
 done
 fi
 
-# 6. Cache servers: ALWAYS cycle both, never reuse.
+# 6. Cache servers: always cycled, never reused — both ranks' cache servers are
+#    cycled at TP=2; rank 0's alone at TP=1.
 #    A surviving cache server holds the previous engine's KV cache through CUDA
 #    IPC and never releases it, so the next engine start fails with
 #    "Free memory on device cuda:0 ... less than desired GPU memory utilization".
 #    Harmless on a true cold boot (nothing survives); essential whenever this
 #    script is used to recover a warm machine.
-[ "$MULTI" = "1" ] && docker exec "$C0" bash -c 'pkill -f "[l]mcache server"; true'
-ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec ggbuild bash -c 'pkill -f \"[l]mcache server\"; true'" || true
+docker exec "$C0" bash -c 'pkill -f "[l]mcache server"; true'
+[ "$MULTI" = "1" ] && ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec ggbuild bash -c 'pkill -f \"[l]mcache server\"; true'" || true
 sleep 6
 
-[ "$MULTI" = "1" ] && docker exec -d "$C0" bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
-ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec -d ggbuild bash -c 'RANK=1 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r1.log 2>&1'" || true
+docker exec -d "$C0" bash -c "RANK=0 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r0.log 2>&1"
+[ "$MULTI" = "1" ] && ssh -o BatchMode=yes -o ConnectTimeout=5 "$RANK1"     "docker exec -d ggbuild bash -c 'RANK=1 bash /ws/lmcache-server.sh > /ws/logs/lmcache-r1.log 2>&1'" || true
 
 # 7. Wait for BOTH to bind before handing off (the launcher gates on both).
 for i in $(seq 1 60); do
@@ -112,7 +115,7 @@ for i in $(seq 1 60); do
     else
       ss -tln | grep -q ':6556 ' && break
     fi
-
+    sleep 5
 done
 ss -tln | grep -q ':6556 ' || { echo "boot: FATAL — rank 0 cache server never bound 6556"; exit 1; }
 

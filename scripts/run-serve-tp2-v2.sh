@@ -5,18 +5,27 @@
 # A/B gates. Bare defaults are the A/B baseline — the PRODUCTION
 # configuration is what start-stack.sh passes (TP=2 LMC=1 APC=1 STRIPE=2 MTPK=3
 # KVDTYPE=fp8 STAGE=graph BATCHTOK=3072 GPUMEM=0.70):
-#   STAGE=graph|eager   graph = EXL3 CUDA-graph decode (validated 3/3 vs eager, +25%)
-#   APC=0|1             1 = prefix caching + mamba align (scheduler fix ported, 20/20
-#                       regression tests; not yet live-validated)
-#   FP8PREFILL=1|0      FP8 prefill GEMM: 662 -> 1433 tok/s measured; prefill-only
-#                       E4M3 numerics, decode keeps exact trellis kernels
+#   STAGE=graph|eager   graph = EXL3 CUDA-graph decode: graph capture measured +25%
+#                       decode vs eager at TP2/4K; output equivalence checked on 3
+#                       canary prompts (answer-correctness, not byte-compare)
+#   APC=0|1             1 = prefix caching with --mamba-cache-mode align. Safe only
+#                       with the #51113 chunk-splitting port in patches/fork-ports.patch.
+#                       Status: qualified — validated by the README APC replay check.
+#   FP8PREFILL=1|0      FP8 prefill GEMM, measured at TP2, 4K context, BATCHTOK=3072:
+#                       662 -> 1433 tok/s (2.16x); E4M3 on prefill GEMMs only, decode
+#                       keeps exact trellis kernels
 #   MTPK=3              speculative depth. 3 measured faster than 2 at TP2 on both
 #                       single-stream (+9.0%) and 4-stream (+3.5%) with prefill flat;
 #                       2 is the safer choice for saturated many-stream serving.
-#   BATCHTOK=8192       max-num-batched-tokens (sweep: 3072/4096/8192)
-#   TP=2                1 = single Spark (drops ray, striping, rank-1 cache server;
-#                       expect ~17 tok/s decode, ~700 prefill, ~1.65M KV @ GPUMEM=0.70)
-#   KVDTYPE=auto        fp8 = FP8 KV cache (community: avoids -33% long-depth penalty)
+#   BATCHTOK=8192       max-num-batched-tokens. 3072 is the production value; 4096/8192
+#                       measured within noise of it at TP2/4K, and any value >= 2x the
+#                       LMCache chunk (3200) violates the LMC=1 alignment guard
+#   TP=2                1 = single Spark (drops ray, striping and the rank-1 cache
+#                       server; 23.8 tok/s single-stream decode at 4K, KV pool
+#                       1,669,678 tokens at GPUMEM=0.70; single-Spark prefill is
+#                       unresolved — see README "One Spark or two")
+#   KVDTYPE=auto        fp8 = FP8 KV cache: halves KV bytes; the long-context decode
+#                       penalty of bf16 KV was not isolated on this hardware
 # Site config: scripts/site.env if present, else the reference values below.
 [ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"
 set -u
@@ -28,8 +37,9 @@ fi
 
 STAGE="${STAGE:-graph}"
 APC="${APC:-0}"
-SPEC="${SPEC:-mtp}"   # mtp = built-in MTP head. (dspark needs a separately prepared
-                      # drafter checkpoint NOT included in this recipe; trial closed negative.)
+SPEC="${SPEC:-mtp}"   # mtp = built-in MTP head. SPEC=dspark selects a separate drafter
+                      # model instead of the built-in MTP head. Status: unsupported here —
+                      # requires a drafter checkpoint this repository does not distribute.
 MTPK="${MTPK:-3}"
 BATCHTOK="${BATCHTOK:-8192}"
 KVDTYPE="${KVDTYPE:-auto}"

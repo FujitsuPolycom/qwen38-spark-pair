@@ -1,5 +1,6 @@
 #!/bin/bash
-# Join ray cluster as rank-1 worker. Run inside ggrun on spark-931e.
+# Join ray cluster as rank-1 worker. Run inside the rank-1 serving container
+# (C1, `ggbuild` on the reference pair).
 # Site config: scripts/site.env if present, else the reference values below.
 [ -f "${SITE_ENV:-/ws/site.env}" ] && . "${SITE_ENV:-/ws/site.env}"
 set -u

@@ -2,7 +2,7 @@
 
 **A step-by-step recipe for serving [`malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated`](https://huggingface.co/malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated) on one or two NVIDIA DGX Spark (GB10) nodes** — `TP=1` on a single Spark or `TP=2` across a pair — with MTP speculative decoding, CUDA-graph decode, FP8 prefill+KV, prefix caching, an LMCache L1+NVMe KV tier, and (at `TP=2`) 2-rail RoCE striping. Despite the repository name, one Spark is enough: `TP=1` drops the fabric phases entirely ([One Spark or two](#one-spark-or-two)).
 
-Measured on one such pair — the "reference pair" referenced throughout: **32.0 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 15.1× replay speedup from the NVMe cache tier · byte-exact greedy outputs throughout.** A single Spark at `TP=1` serves the same stack at **23.8 tok/s single-stream · 85 tok/s aggregate @ 4 streams** with a 1.67M-token KV pool. Near-BF16 quality (checkpoint KLD 0.00276 vs BF16).
+Measured on one such pair — the "reference pair" referenced throughout: **32.0 tok/s single-stream · 275 tok/s aggregate @ 64 streams · ~1,375 tok/s cold prefill · 15.1× replay speedup from the NVMe cache tier · byte-exact greedy outputs throughout.** A single Spark at `TP=1` serves the same stack at **23.8 tok/s single-stream · 85 tok/s aggregate @ 4 streams** with a 1.67M-token KV pool. Near-BF16 quality inherited from the checkpoint (KLD 0.00276 vs BF16, measured by the checkpoint author on an RTX 5090, not on GB10).
 
 This document is written to be executed by an LLM agent with SSH access to the Spark — or both Sparks at `TP=2`. Each phase ends with a **Verify** gate — do not proceed past a failed gate. Every site-specific value is listed in [Site values](#site-values); substitute yours throughout.
 
@@ -37,7 +37,9 @@ RDMA device per card, the rail prefix, and the **RoCE v2** GID index (the same a
 appears as RoCE v1 at a different index — picking that one yields a fabric that misbehaves
 rather than fails, so the detector filters by type). Anything it cannot determine is emitted as
 `REPLACE_WITH_*` and it exits non-zero, so a partial detection is obvious. On the reference pair
-it reproduces all 13 values correctly. **Review the output before using it** — it is a starting
+it reproduces every probe-able setting correctly; rank 1's container name (`C1`) is not
+detectable from rank 0 and is emitted as the reference default (`ggbuild`), so review it in
+particular. **Review the output before using it** — it is a starting
 point, not an oracle.
 
 Or fill it in by hand:
@@ -112,7 +114,7 @@ sudo tee /etc/cron.d/nvidia-dev-char <<< "@reboot root /usr/bin/nvidia-ctk syste
 **Verify:** `ls /dev/char | wc -l` returns a few hundred entries (357 on the reference pair, which
 varies with driver capability count) and `ls -l /dev/char/195:0` resolves to `../nvidia0`.
 
-   `scripts/boot-stack-aa42.sh` (the boot-persistence script installed in Phase 9) also detects the condition and restarts the container, but preventing it
+   `scripts/boot-stack-aa42.sh` (the rank-0 boot-persistence script; Phase 9 covers installing it) also detects the condition and restarts the container, but preventing it
    is better than recovering from it — the recovery costs a restart cycle and only fires at boot.
 
 4. [both, optional] NET_ADMIN helper for sudo-less rail IPs at boot: `docker run -d --name netadm --restart unless-stopped --network host --cap-add NET_ADMIN ubuntu:24.04 sleep infinity`.
@@ -199,8 +201,7 @@ Every external reference in this recipe resolved on that date. Full identities:
 | base image | `nvcr.io/nvidia/cuda@sha256:5c36750138dc1447a17dafbb397674f167d3b44ce18d9160d769df114577b35d` |
 
 Shorthand used in the phases: fork base `fa033bd4e`,
-PR-318 head `2b96dad45`, exllamav3 `5f3c537`, lmcache `0.5.2` on PyPI (latest is 0.5.3 —
-0.5.2 is deliberate, the heartbeat patch is written against it), the sparkring repository,
+PR-318 head `2b96dad45`, exllamav3 `5f3c537`, lmcache `0.5.2` on PyPI, the sparkring repository,
 and the Hugging Face checkpoint. If a build fails at one of these, check whether the pin
 moved before debugging anything else.
 
@@ -210,7 +211,8 @@ moved before debugging anything else.
    its model card can change while the weight files stay the same):
 
 ```
-huggingface-cli download malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated \n  --revision ab3a91a13813df8096cb4c1d560ed3669035d0cf --local-dir /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated
+huggingface-cli download malaiwah/Qwen3.8-27B-EXL3-K5K6-hydrated \
+  --revision ab3a91a13813df8096cb4c1d560ed3669035d0cf --local-dir /ws/model/Qwen3.8-27B-EXL3-K5K6-hydrated
 ```
 
    Verify SHA256s against the repo's manifest — 16/16 must match. The weight shards at this
@@ -249,7 +251,7 @@ Copy `/ws/{venv,src,model,nccl-patched,patches}` and all `scripts/*` to rank1's 
 cd /ws/venv/lib/python3.12/site-packages && patch -p1 < /ws/patches/lmcache-0.5.2-heartbeat-fix.patch
 ```
 
-Stock 0.5.2 initializes the scheduler adapter's heartbeat registry to `{}` and then guards the lazy starter with `if self._heartbeats is not None:`. An empty dict is not `None`, so the guard always returns and the thread-creation loop is unreachable: the process never logs `Started PeriodicThread: lmcache-heartbeat`, and each server's health event stays at its constructed value, so the scheduler's view of server health is permanently healthy and it never enters degraded mode. Observed on this stack before the patch: every cache lookup returned 0 while stores kept working, and benchmarks still passed because they query right after a restart. Treat the link between defect and symptom as observed rather than established -- `lmcache.mp.mq_timeout` was raised from 10 to 60 in the same change window, so the field A/B does not isolate the patch. The defect itself is unambiguous in the source and the fix is two characters, so apply it either way.
+Stock 0.5.2 initializes the scheduler adapter's heartbeat registry to `{}` and then guards the lazy starter with `if self._heartbeats is not None:`. An empty dict is not `None`, so the guard always returns and the thread-creation loop is unreachable: the process never logs `Started PeriodicThread: lmcache-heartbeat`, and each server's health event stays at its constructed value, so the scheduler's view of server health is permanently healthy and it never enters degraded mode. Observed on this stack before the patch: every cache lookup returned 0 while stores kept working, and benchmarks still passed because they query right after a restart. Status: the defect is unambiguous in the source and the fix is two characters; the causal link to the observed zero-hit symptom is not isolated, because `lmcache.mp.mq_timeout` was changed from 10 to 60 in the same deployment. Apply the patch regardless.
 
 3. [both] NVMe cache dir `mkdir -p /ws/lmcache-l2`.
 4. Server config is `scripts/lmcache-server.sh` — one server per rank, port 6556. Sizing rules baked in, don't lower them casually:
@@ -294,7 +296,7 @@ The serve script's gates (each is one env var + restart to A/B):
 |---|---|---|
 | `LMC` | 1 | LMCache connector on. **Forces `BATCHTOK ∈ [1600,3200)`** — the mamba-align guard; 3072 is the best legal value (~8% cold-prefill cost, invisible under concurrent load). `LMC=0` → use `BATCHTOK=8192` |
 | `APC` | 1 | prefix caching + `--mamba-cache-mode align` (safe only because of the #51113 port) |
-| `STRIPE` | 2 | 2-rail patched-NCCL transport (0 = stock single-cable) |
+| `STRIPE` | 2 | 2-rail patched-NCCL transport (0 = stock single-cable). `STRIPE=1` selects four rails across all four cables — research-only: microbenchmark measures 176 Gb/s aggregate collectives vs 106 single-card, but end-to-end single-stream decode measures −28% vs the two-rail setting, so `STRIPE=2` is the served configuration |
 | `MTPK` | 3 | MTP speculative depth. Measured at TP2, ctx 4096, six samples per depth: depth 3 raises single-stream from 29.37 to 32.01 tok/s (+9.0%) and four-stream aggregate from 107.6 to 111.4 (+3.5%), both larger than the combined standard error, while prefill moves −1% (1359 → 1348 tok/s at 4K). Mean acceptance is 2.95 tokens per step at depth 3 against 2.5–2.65 at depth 2. Depth 2 remains the safer choice for saturated many-stream serving, which these measurements do not cover |
 | `KVDTYPE` | fp8 | FP8 KV cache — doubles the KV pool |
 | `GPUMEM` | 0.70 | fraction of **unified** memory for the engine. Measured pools: 0.40 → 1,842,455 tokens · 0.55 → 2,852,305 · 0.70 → ~3.9M. Community guidance for GB10 is ≤0.70 — the usual discrete-GPU 0.85–0.95 does not apply, since the OS, page cache, ray and the cache servers draw from the same pool |
@@ -305,7 +307,7 @@ The serve script's gates (each is one env var + restart to A/B):
 
 Fixed flags worth knowing: `--attention-backend TRITON_ATTN`, `--mm-encoder-attn-backend TORCH_SDPA`, and `"attention_backend":"TRITON_ATTN"` **inside** the speculative config — all three pins exist because driver 580 cannot JIT the build's CUDA-13.2 FlashAttention PTX; the drafter crashes without its own pin. The `RECON_M` and `FP8PREFILL` gates above set `VLLM_EXL3_PREFILL_RECONSTRUCT_M` and `VLLM_EXL3_PREFILL_FP8`; both default to the production values, so leaving them unset is the same as passing them.
 
-Boot persistence: install `scripts/boot-*.sh` as `@reboot` crontabs (edit the env gates in the serve line to match production first).
+Boot persistence: install the boot-persistence scripts (`scripts/boot-stack-aa42.sh` on rank 0, `scripts/boot-worker-931e.sh` on rank 1) as `@reboot` user crontab entries; installing them makes this stack the node's boot owner, replacing whatever `@reboot` line the crontab currently carries (edit the env gates in the serve line to match production first).
 
 ## One Spark or two
 
@@ -427,11 +429,12 @@ Two operational rules that follow from the above:
 
 ## Phase 10 — Validation gauntlet
 
-The companion profile ships an automated version of these checks:
-[`test_correctness.py`](https://github.com/FujitsuPolycom/inference-runtime-profiles/blob/master/profiles/qwen38-27b-exl3-k5k6-mtp2-lmcache-2x-spark/test_correctness.py)
-(byte-exactness, cache-hit, and a separate `--stage heartbeat` that must run **>4 minutes after
-engine start** — the one gate that catches the heartbeat bug, which every immediate-replay test
-passes).
+An automated form of these checks (byte-exactness, cache hit, delayed heartbeat) is published
+as the runtime profile `qwen38-27b-exl3-k5k6-lmcache-2x-spark` in
+`FujitsuPolycom/inference-runtime-profiles`:
+[`test_correctness.py`](https://github.com/FujitsuPolycom/inference-runtime-profiles/blob/master/profiles/qwen38-27b-exl3-k5k6-lmcache-2x-spark/test_correctness.py).
+Its `--stage heartbeat` must run **>4 minutes after engine start** — the one gate that catches
+the heartbeat bug, which every immediate-replay test passes.
 
 1. **Liveness:** `curl http://<rank0-lan>:8000/v1/models`.
 2. **Exactness:** a few greedy (`temperature 0`) probes — arithmetic, instruction-following. Re-run each twice: byte-identical.
@@ -441,7 +444,7 @@ passes).
 6. **Wait 4+ minutes, replay again** — this specifically catches the heartbeat bug's signature (works-then-silently-stops). Expect hits, not a slow recompute.
 7. **Perf reference (yours should be in the same ballpark):** cc1 ≈ 32 tok/s at `MTPK=3` · cc64 ≈ 275 aggregate · cold prefill ≈ 1,375 tok/s @ BATCHTOK 3072. Single-stream throughput varies about 12% between runs, so compare medians of several runs rather than single values.
 
-## Troubleshooting (the mistakes already made for you)
+## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -463,7 +466,7 @@ passes).
 
 ## Known limitations
 
-Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's model-card KLD measurements, taken on an RTX 5090; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the 3.9M-token pool caps that regime at roughly 29 streams at 131K or 14 at the full 262K. L1 eviction in stock lmcache never demotes to NVMe (write-through covers it — but that's why the heartbeat+sizing fixes matter).
+Cold prefill pays ~8% for the LMCache batch guard. Sub-1600-token prompt tails always recompute (chunk granularity). No KLD measured on GB10 (quality inherited from the checkpoint's model-card KLD measurements, taken on an RTX 5090; extensive byte-exactness spot checks only). Concurrency is validated to 64 streams at short-to-mid context (cc1–8 at 16K and 32K, ~16K average context per stream at cc64) and single-stream to 227K tokens; many streams at 100K+ each is untested, and the 3.9M-token pool caps that regime at roughly 29 streams at 131K or 14 at the full 262K. Stock lmcache never demotes evicted L1 chunks to NVMe; write-through means the chunk is already on L2, so eviction costs a re-stage rather than a loss — which is why the L1 sizing rule above is a correctness constraint, not a tuning knob.
 
 ## Credits
 
