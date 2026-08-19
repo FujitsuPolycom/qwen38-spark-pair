@@ -11,6 +11,8 @@ writing standard in [AGENTS.md](AGENTS.md).
 
 > The [sparkring](https://github.com/FujitsuPolycom/sparkring) project (same maintainer) supplies two ingredients: the switchless-ring NCCL patches built in Phase 6 and the container image pin in Phase 2. This repository consumes them at pinned revisions and modifies neither sparkring nor any other upstream.
 
+> The same pair of Sparks can instead serve **DeepSeek-V4-Flash** (284B MoE) with DSpark speculation and a restart-surviving LMCache NVMe tier, using the sparkring runtime image rather than this repository's from-source build. That deployment is published as the runtime profile [`deepseek-v4-flash-0731-sparkring-runtime-2x-spark`](https://github.com/FujitsuPolycom/inference-runtime-profiles/tree/master/profiles/deepseek-v4-flash-0731-sparkring-runtime-2x-spark) — launch scripts, environment capture, and correctness gates included. The two stacks coexist on disk; whichever owns boot is one crontab entry per node.
+
 ---
 
 ## What you need
